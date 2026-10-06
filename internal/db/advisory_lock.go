@@ -1,8 +1,11 @@
 package db
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"hash/crc32"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -94,37 +97,52 @@ func sqliteNewAdvisoryLock(names ...string) AdvisoryLock {
 	return lock
 }
 
+type postgresAdvisoryLockExecutor struct {
+	conn *sql.Conn
+}
+
+func (e *postgresAdvisoryLockExecutor) Exec(query string, args ...any) (sql.Result, error) {
+	return e.conn.ExecContext(context.Background(), adaptQuery(query), args...)
+}
+
+func (e *postgresAdvisoryLockExecutor) Query(query string, args ...any) (*sql.Rows, error) {
+	return e.conn.QueryContext(context.Background(), adaptQuery(query), args...)
+}
+
+func (e *postgresAdvisoryLockExecutor) QueryRow(query string, args ...any) *sql.Row {
+	return e.conn.QueryRowContext(context.Background(), adaptQuery(query), args...)
+}
+
 type postgresAdvisoryLock struct {
 	Executor
-	name  string
-	count int
-	err   error
-	keyA  int32
-	keyB  int32
+	lockDB *sql.DB
+	conn   *sql.Conn
+	name   string
+	count  int
+	err    error
+	keyA   int32
+	keyB   int32
 }
 
-func (l *postgresAdvisoryLock) commit() {
-	if l.Executor == nil {
-		return
-	}
-	err := l.Executor.(*Tx).Commit()
-	if err != nil {
-		lockLog.Error("lock tx commit failed", "error", err, "name", l.name)
-		return
-	}
+func (l *postgresAdvisoryLock) close() {
 	l.Executor = nil
-}
+	l.count = 0
 
-// releases the tx (and its pooled connection) when no lock is held
-func (l *postgresAdvisoryLock) rollbackIfUnlocked() {
-	if l.count != 0 || l.Executor == nil {
-		return
+	if l.conn != nil {
+		if err := l.conn.Close(); err != nil {
+			l.err = errors.Join(l.err, err)
+			lockLog.Error("lock connection close failed", "error", err, "name", l.name)
+		}
+		l.conn = nil
 	}
-	err := l.Executor.(*Tx).Rollback()
-	if err != nil {
-		lockLog.Error("lock tx rollback failed", "error", err, "name", l.name)
+
+	if l.lockDB != nil {
+		if err := l.lockDB.Close(); err != nil {
+			l.err = errors.Join(l.err, err)
+			lockLog.Error("lock database close failed", "error", err, "name", l.name)
+		}
+		l.lockDB = nil
 	}
-	l.Executor = nil
 }
 
 func (l *postgresAdvisoryLock) GetName() string {
@@ -133,77 +151,86 @@ func (l *postgresAdvisoryLock) GetName() string {
 
 func (l *postgresAdvisoryLock) Acquire() bool {
 	if l.Executor == nil {
-		lockLog.Error("acquire failed, lock tx closed", "name", l.name)
+		lockLog.Error("acquire failed, lock connection closed", "name", l.name)
 		return false
 	}
+
 	_, err := l.Exec("SELECT pg_advisory_lock(?, ?)", l.keyA, l.keyB)
 	if err != nil {
-		lockLog.Error("acquire failed", "error", err, "name", l.name)
 		l.err = errors.Join(l.err, err)
-		l.rollbackIfUnlocked()
+		lockLog.Error("acquire failed", "error", err, "name", l.name)
+		l.close()
 		return false
 	}
+
 	l.count++
 	return true
 }
 
 func (l *postgresAdvisoryLock) TryAcquire() bool {
 	if l.Executor == nil {
-		lockLog.Error("try acquire failed, lock tx closed", "name", l.name)
+		lockLog.Error("try acquire failed, lock connection closed", "name", l.name)
 		return false
 	}
+
 	row := l.QueryRow("SELECT pg_try_advisory_lock(?, ?)", l.keyA, l.keyB)
+
 	var acquired bool
 	if err := row.Scan(&acquired); err != nil {
 		l.err = errors.Join(l.err, err)
-		lockLog.Error("try acquire failed", "error", l.err, "name", l.name)
-		l.rollbackIfUnlocked()
+		lockLog.Error("try acquire failed", "error", err, "name", l.name)
+		l.close()
 		return false
 	} else if !acquired {
 		lockLog.Debug("try acquire failed", "name", l.name, "count", l.count)
-		l.rollbackIfUnlocked()
+		l.close()
 		return false
 	}
+
 	l.count++
-	return acquired
+	return true
 }
 
 func (l *postgresAdvisoryLock) Release() bool {
-	if l.count == 0 {
-		l.commit()
+	if l.count == 0 || l.Executor == nil {
+		l.close()
 		return false
 	}
+
 	row := l.QueryRow("SELECT pg_advisory_unlock(?, ?)", l.keyA, l.keyB)
+
 	var released bool
 	if err := row.Scan(&released); err != nil {
 		l.err = errors.Join(l.err, err)
-		lockLog.Error("release failed", "error", l.err, "name", l.name)
+		lockLog.Error("release failed", "error", err, "name", l.name)
+		l.close()
 		return false
 	} else if !released {
 		lockLog.Debug("release failed", "name", l.name, "count", l.count)
+		l.close()
 		return false
 	}
+
 	l.count--
 	if l.count == 0 {
-		l.commit()
+		l.close()
 	}
+
 	return true
 }
 
 func (l *postgresAdvisoryLock) ReleaseAll() bool {
 	if l.count == 0 {
-		l.commit()
+		l.close()
 		return false
 	}
-	for range l.count {
+
+	for l.count > 0 {
 		if !l.Release() {
-			break
+			return false
 		}
 	}
-	if l.count != 0 {
-		lockLog.Error("release all failed", "name", l.name, "count", l.count)
-		return false
-	}
+
 	return true
 }
 
@@ -213,14 +240,33 @@ func (l *postgresAdvisoryLock) Err() error {
 
 func postgresNewAdvisoryLock(names ...string) AdvisoryLock {
 	name := strings.Join(names, ":")
-	tx, err := Begin()
+
+	// PostgreSQL advisory locks are session-scoped. Keep them on a dedicated
+	// connection outside the application pool so code protected by the lock can
+	// still use the normal pool without risking pool exhaustion or deadlock.
+	lockDB, err := sql.Open(db.URI.DriverName, db.URI.DSN(func(_ *url.URL, q *url.Values) {
+		q.Del("pool_max_conns")
+		q.Del("pool_min_conns")
+	}))
 	if err != nil {
-		lockLog.Error("lock tx begin failed", "error", err, "name", name)
+		lockLog.Error("lock database open failed", "error", err, "name", name)
 		return nil
 	}
+	lockDB.SetMaxOpenConns(1)
+	lockDB.SetMaxIdleConns(0)
+
+	conn, err := lockDB.Conn(context.Background())
+	if err != nil {
+		_ = lockDB.Close()
+		lockLog.Error("lock connection failed", "error", err, "name", name)
+		return nil
+	}
+
 	keyA, keyB := getAdvisoryLockKeyPair(names...)
 	return &postgresAdvisoryLock{
-		Executor: tx,
+		Executor: &postgresAdvisoryLockExecutor{conn: conn},
+		lockDB:   lockDB,
+		conn:     conn,
 		name:     name,
 		keyA:     int32(keyA),
 		keyB:     int32(keyB),
