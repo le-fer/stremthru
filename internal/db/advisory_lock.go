@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"hash/crc32"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -97,36 +96,59 @@ func sqliteNewAdvisoryLock(names ...string) AdvisoryLock {
 	return lock
 }
 
-type postgresAdvisoryLockExecutor struct {
-	conn *sql.Conn
-}
+// Bound dedicated lock connections per process independently of the application
+// pool. PostgreSQL must have capacity for both pools across all instances.
+const (
+	postgresAdvisoryLockMaxConns                = 8
+	postgresAdvisoryLockAcquireTimeout          = 30 * time.Second
+	postgresAdvisoryLockMigrationAcquireTimeout = 10 * time.Minute
+	postgresAdvisoryLockCleanupTimeout          = 5 * time.Second
+)
 
-func (e *postgresAdvisoryLockExecutor) Exec(query string, args ...any) (sql.Result, error) {
-	return e.conn.ExecContext(context.Background(), adaptQuery(query), args...)
-}
-
-func (e *postgresAdvisoryLockExecutor) Query(query string, args ...any) (*sql.Rows, error) {
-	return e.conn.QueryContext(context.Background(), adaptQuery(query), args...)
-}
-
-func (e *postgresAdvisoryLockExecutor) QueryRow(query string, args ...any) *sql.Row {
-	return e.conn.QueryRowContext(context.Background(), adaptQuery(query), args...)
-}
+var postgresAdvisoryLockSlots = make(chan struct{}, postgresAdvisoryLockMaxConns)
 
 type postgresAdvisoryLock struct {
 	Executor
-	lockDB *sql.DB
-	conn   *sql.Conn
-	name   string
-	count  int
-	err    error
-	keyA   int32
-	keyB   int32
+	pool           *sql.DB
+	conn           *sql.Conn
+	tx             *sql.Tx
+	name           string
+	count          int
+	err            error
+	keyA           int32
+	keyB           int32
+	hasSlot        bool
+	txCancel       context.CancelFunc
+	acquireTimeout time.Duration
 }
 
-func (l *postgresAdvisoryLock) close() {
+// database/sql has no context-taking Commit or Rollback. The pgx adapter uses
+// the original BeginTx context for both, so cancel that context if cleanup stalls.
+func (l *postgresAdvisoryLock) limitTransactionCleanup() func() {
+	if l.txCancel == nil {
+		return func() {}
+	}
+	timer := time.AfterFunc(postgresAdvisoryLockCleanupTimeout, l.txCancel)
+	return func() { timer.Stop() }
+}
+
+func (l *postgresAdvisoryLock) cleanup() {
 	l.Executor = nil
 	l.count = 0
+
+	if l.tx != nil {
+		stop := l.limitTransactionCleanup()
+		if err := l.tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			l.err = errors.Join(l.err, err)
+			lockLog.Error("lock tx rollback failed", "error", err, "name", l.name)
+		}
+		stop()
+		l.tx = nil
+	}
+	if l.txCancel != nil {
+		l.txCancel()
+		l.txCancel = nil
+	}
 
 	if l.conn != nil {
 		if err := l.conn.Close(); err != nil {
@@ -136,84 +158,137 @@ func (l *postgresAdvisoryLock) close() {
 		l.conn = nil
 	}
 
-	if l.lockDB != nil {
-		if err := l.lockDB.Close(); err != nil {
-			l.err = errors.Join(l.err, err)
-			lockLog.Error("lock database close failed", "error", err, "name", l.name)
-		}
-		l.lockDB = nil
+	l.pool = nil
+
+	if l.hasSlot {
+		<-postgresAdvisoryLockSlots
+		l.hasSlot = false
 	}
+}
+
+func (l *postgresAdvisoryLock) commit() bool {
+	if l.tx == nil {
+		l.cleanup()
+		return false
+	}
+
+	stop := l.limitTransactionCleanup()
+	commitErr := l.tx.Commit()
+	stop()
+	l.tx = nil
+	if commitErr != nil {
+		l.err = errors.Join(l.err, commitErr)
+		lockLog.Error("lock tx commit failed", "error", commitErr, "name", l.name)
+	}
+
+	l.cleanup()
+	return commitErr == nil && l.err == nil
 }
 
 func (l *postgresAdvisoryLock) GetName() string {
 	return l.name
 }
 
-func (l *postgresAdvisoryLock) Acquire() bool {
-	if l.Executor == nil {
-		lockLog.Error("acquire failed, lock connection closed", "name", l.name)
+// open reserves capacity and connects only when acquisition is attempted.
+func (l *postgresAdvisoryLock) open(ctx context.Context, try bool) (stage string, opened bool, err error) {
+	if l.pool == nil {
+		return "open", false, errors.New("lock connection closed")
+	}
+	if l.tx != nil {
+		return "", true, nil
+	}
+	if try {
+		select {
+		case postgresAdvisoryLockSlots <- struct{}{}:
+		default:
+			return "capacity", false, nil
+		}
+	} else {
+		select {
+		case postgresAdvisoryLockSlots <- struct{}{}:
+		case <-ctx.Done():
+			return "capacity", false, ctx.Err()
+		}
+	}
+	l.hasSlot = true
+
+	conn, err := l.pool.Conn(ctx)
+	if err != nil {
+		return "connect", false, err
+	}
+	l.conn = conn
+
+	// Bound BEGIN without tying the lifetime of a held lock to the acquisition
+	// deadline. Stop forwarding cancellation once transaction setup completes.
+	txCtx, cancel := context.WithCancel(context.Background())
+	l.txCancel = cancel
+	stop := context.AfterFunc(ctx, cancel)
+	defer stop()
+	tx, err := conn.BeginTx(txCtx, nil)
+	if err != nil {
+		return "begin", false, err
+	}
+	l.tx = tx
+	l.Executor = &Tx{tx: tx, exec: getExec(tx)}
+	return "begin", true, ctx.Err()
+}
+
+func (l *postgresAdvisoryLock) acquire(ctx context.Context, try bool) (acquired bool) {
+	started := time.Now()
+	defer func() {
+		if !acquired {
+			l.cleanup()
+		}
+	}()
+
+	stage, opened, err := l.open(ctx, try)
+	if err == nil && !opened {
+		lockLog.Debug("try acquire skipped, lock connection capacity full", "name", l.name, "limit", postgresAdvisoryLockMaxConns)
 		return false
 	}
-
-	_, err := l.Exec("SELECT pg_advisory_lock(?, ?)", l.keyA, l.keyB)
+	if err == nil {
+		stage = "lock"
+		if try {
+			err = l.tx.QueryRowContext(ctx, "SELECT pg_try_advisory_xact_lock($1, $2)", l.keyA, l.keyB).Scan(&acquired)
+		} else {
+			_, err = l.tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1, $2)", l.keyA, l.keyB)
+			acquired = err == nil
+		}
+	}
 	if err != nil {
 		l.err = errors.Join(l.err, err)
-		lockLog.Error("acquire failed", "error", err, "name", l.name)
-		l.close()
+		lockLog.Error("acquire failed", "error", err, "name", l.name, "stage", stage, "try", try, "elapsed", time.Since(started))
 		return false
 	}
+	if acquired {
+		l.count++
+	} else {
+		lockLog.Debug("try acquire skipped, lock held by another session", "name", l.name, "count", l.count)
+	}
+	return acquired
+}
 
-	l.count++
-	return true
+func (l *postgresAdvisoryLock) Acquire() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), l.acquireTimeout)
+	defer cancel()
+	return l.acquire(ctx, false)
 }
 
 func (l *postgresAdvisoryLock) TryAcquire() bool {
-	if l.Executor == nil {
-		lockLog.Error("try acquire failed, lock connection closed", "name", l.name)
-		return false
-	}
-
-	row := l.QueryRow("SELECT pg_try_advisory_lock(?, ?)", l.keyA, l.keyB)
-
-	var acquired bool
-	if err := row.Scan(&acquired); err != nil {
-		l.err = errors.Join(l.err, err)
-		lockLog.Error("try acquire failed", "error", err, "name", l.name)
-		l.close()
-		return false
-	} else if !acquired {
-		lockLog.Debug("try acquire failed", "name", l.name, "count", l.count)
-		l.close()
-		return false
-	}
-
-	l.count++
-	return true
+	ctx, cancel := context.WithTimeout(context.Background(), postgresAdvisoryLockAcquireTimeout)
+	defer cancel()
+	return l.acquire(ctx, true)
 }
 
 func (l *postgresAdvisoryLock) Release() bool {
 	if l.count == 0 || l.Executor == nil {
-		l.close()
-		return false
-	}
-
-	row := l.QueryRow("SELECT pg_advisory_unlock(?, ?)", l.keyA, l.keyB)
-
-	var released bool
-	if err := row.Scan(&released); err != nil {
-		l.err = errors.Join(l.err, err)
-		lockLog.Error("release failed", "error", err, "name", l.name)
-		l.close()
-		return false
-	} else if !released {
-		lockLog.Debug("release failed", "name", l.name, "count", l.count)
-		l.close()
+		l.cleanup()
 		return false
 	}
 
 	l.count--
 	if l.count == 0 {
-		l.close()
+		return l.commit()
 	}
 
 	return true
@@ -221,7 +296,7 @@ func (l *postgresAdvisoryLock) Release() bool {
 
 func (l *postgresAdvisoryLock) ReleaseAll() bool {
 	if l.count == 0 {
-		l.close()
+		l.cleanup()
 		return false
 	}
 
@@ -241,34 +316,22 @@ func (l *postgresAdvisoryLock) Err() error {
 func postgresNewAdvisoryLock(names ...string) AdvisoryLock {
 	name := strings.Join(names, ":")
 
-	// PostgreSQL advisory locks are session-scoped. Keep them on a dedicated
-	// connection outside the application pool so code protected by the lock can
-	// still use the normal pool without risking pool exhaustion or deadlock.
-	lockDB, err := sql.Open(db.URI.DriverName, db.URI.DSN(func(_ *url.URL, q *url.Values) {
-		q.Del("pool_max_conns")
-		q.Del("pool_min_conns")
-	}))
-	if err != nil {
-		lockLog.Error("lock database open failed", "error", err, "name", name)
-		return nil
-	}
-	lockDB.SetMaxOpenConns(1)
-	lockDB.SetMaxIdleConns(0)
-
-	conn, err := lockDB.Conn(context.Background())
-	if err != nil {
-		_ = lockDB.Close()
-		lockLog.Error("lock connection failed", "error", err, "name", name)
+	if db.advisoryLocks == nil {
+		lockLog.Error("lock database pool unavailable", "name", name)
 		return nil
 	}
 
 	keyA, keyB := getAdvisoryLockKeyPair(names...)
+	acquireTimeout := postgresAdvisoryLockAcquireTimeout
+	// Concurrent startup must allow time for another instance's migrations.
+	if len(names) == 2 && names[0] == "goose" && names[1] == "migration" {
+		acquireTimeout = postgresAdvisoryLockMigrationAcquireTimeout
+	}
 	return &postgresAdvisoryLock{
-		Executor: &postgresAdvisoryLockExecutor{conn: conn},
-		lockDB:   lockDB,
-		conn:     conn,
-		name:     name,
-		keyA:     int32(keyA),
-		keyB:     int32(keyB),
+		pool:           db.advisoryLocks,
+		name:           name,
+		keyA:           int32(keyA),
+		keyB:           int32(keyB),
+		acquireTimeout: acquireTimeout,
 	}
 }
