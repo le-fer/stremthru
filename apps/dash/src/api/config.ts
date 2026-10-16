@@ -87,8 +87,12 @@ type ConfigStore = {
 };
 
 type ConfigStores = {
+  allow_video_torrents_with_disallowed_files: boolean;
   client_user_agent: string;
+  disallowed_extensions: string[];
   items: ConfigStore[];
+  recheck_missing_file_lists: boolean;
+  recheck_missing_file_lists_cross_store: boolean;
 };
 
 type ConfigTorz = {

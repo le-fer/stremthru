@@ -15,16 +15,34 @@ var SendResponse = stremio_shared.SendResponse
 var SendHTML = stremio_shared.SendHTML
 
 func dedupeStreams(allStreams []WrappedStream) []WrappedStream {
+	// Pending Torz candidates cannot consume siblings until file matching resolves.
+	deferredHashes := map[string]struct{}{}
+	for i := range allStreams {
+		if allStreams[i].deferredTorzFiles {
+			if hash := wrappedStreamHash(&allStreams[i]); hash != "" {
+				deferredHashes[hash] = struct{}{}
+			}
+		}
+	}
 	hashSeen := map[string]struct{}{}
 
 	streams := []WrappedStream{}
 	for i := range allStreams {
 		s := allStreams[i]
 		if s.r != nil && s.r.Hash != "" {
-			if _, seen := hashSeen[s.r.Hash]; seen {
+			hash := wrappedStreamHash(&s)
+			if hash == "" {
+				streams = append(streams, s)
+				continue
+			}
+			if _, deferred := deferredHashes[hash]; deferred {
+				streams = append(streams, s)
+				continue
+			}
+			if _, seen := hashSeen[hash]; seen {
 				continue
 			} else {
-				hashSeen[s.r.Hash] = struct{}{}
+				hashSeen[hash] = struct{}{}
 			}
 		}
 		streams = append(streams, s)

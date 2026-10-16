@@ -79,9 +79,22 @@ func (files Files) HasVideo() bool {
 	return false
 }
 
-func (files Files) HasMaliciousFile() bool {
+func (f File) IsAllowedVideo() bool {
+	return core.IsAllowedVideoFile(f.Name, f.Path)
+}
+
+func (files Files) HasAllowedVideo() bool {
+	for _, f := range files {
+		if f.IsAllowedVideo() {
+			return true
+		}
+	}
+	return false
+}
+
+func (files Files) HasDisallowedFile() bool {
 	for i := range files {
-		if strings.ToLower(filepath.Ext(files[i].Path)) == ".exe" {
+		if core.HasDisallowedExtension(files[i].Name) || core.HasDisallowedExtension(files[i].Path) {
 			return true
 		}
 	}
@@ -328,6 +341,10 @@ var query_get_file = fmt.Sprintf(
 )
 
 func GetFile(hash string, sid string) (*File, error) {
+	hash = core.NormalizeMagnetHash(hash)
+	if hash == "" {
+		return nil, nil
+	}
 	if strings.HasPrefix(sid, "kitsu:") {
 		return getAnimeFileForKitsu(hash, sid)
 	}
@@ -360,6 +377,7 @@ func GetReadCacheStats() (hit int64, miss int64) {
 }
 
 func GetFilesByHashes(hashes []string) (map[string]Files, error) {
+	hashes = core.NormalizeMagnetHashes(hashes)
 	byHash := map[string]Files{}
 
 	if len(hashes) == 0 {
@@ -412,7 +430,11 @@ func TrackFiles(storeCode store.StoreCode, filesByHash map[string]Files) {
 		return
 	}
 
-	items := []InsertData{}
+	fileCount := 0
+	for _, files := range filesByHash {
+		fileCount += len(files)
+	}
+	items := make([]InsertData, 0, fileCount)
 	for hash, files := range filesByHash {
 		shouldIgnoreFiles := storeCode == store.StoreCodePremiumize && !files.HasVideo()
 		if shouldIgnoreFiles {
@@ -558,8 +580,20 @@ func Record(items []InsertData, discardIdx bool) error {
 		count := len(cItems)
 		args := make([]any, 0, count*9)
 		for i := range cItems {
-			item := &cItems[i]
+			item := cItems[i]
+			item.Hash = core.NormalizeMagnetHash(item.Hash)
+			if item.Hash == "" {
+				count--
+				continue
+			}
 			if !strings.HasPrefix(item.Path, "/") {
+				count--
+				continue
+			}
+			// Only the path is persisted. Skip a blocked name whose stored path would
+			// lose that evidence; retain blocked paths for later validation.
+			if core.HasDisallowedExtension(item.Name) && !core.HasDisallowedExtension(item.Path) {
+				count--
 				continue
 			}
 
@@ -640,6 +674,10 @@ var query_get_media_info = fmt.Sprintf(
 )
 
 func GetMediaInfo(hash, path string) *media_info.MediaInfo {
+	hash = core.NormalizeMagnetHash(hash)
+	if hash == "" {
+		return nil
+	}
 	var mi db.JSONB[media_info.MediaInfo]
 	row := db.QueryRow(query_get_media_info, hash, path)
 	if err := row.Scan(&mi); err != nil {
@@ -658,6 +696,10 @@ var query_set_media_info = fmt.Sprintf(
 )
 
 func SetMediaInfo(hash, path string, mediaInfo *media_info.MediaInfo) error {
+	hash = core.NormalizeMagnetHash(hash)
+	if hash == "" {
+		return nil
+	}
 	_, err := db.Exec(query_set_media_info, JSONBMediaInfo(mediaInfo), hash, path)
 	if err == nil {
 		filesByHashCache.Remove(hash)
@@ -676,6 +718,10 @@ var tag_strem_id_query = fmt.Sprintf(
 )
 
 func TagStremId(hash string, filepath string, sid string) {
+	hash = core.NormalizeMagnetHash(hash)
+	if hash == "" {
+		return
+	}
 	if filepath == "" {
 		return
 	}
@@ -703,6 +749,10 @@ var query_tag_anime_strem_id = fmt.Sprintf(
 )
 
 func TagAnimeStremId(hash string, filepath string, sid string) {
+	hash = core.NormalizeMagnetHash(hash)
+	if hash == "" {
+		return
+	}
 	if filepath == "" {
 		return
 	}
@@ -734,6 +784,7 @@ func TagAnimeStremId(hash string, filepath string, sid string) {
 }
 
 func GetStremIdByHashes(hashes []string) (*url.Values, error) {
+	hashes = core.NormalizeMagnetHashes(hashes)
 	byHash := &url.Values{}
 	count := len(hashes)
 	if count == 0 {

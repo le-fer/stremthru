@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/MunifTanjim/go-ptt"
+	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/anidb"
 	"github.com/MunifTanjim/stremthru/internal/cache"
 	"github.com/MunifTanjim/stremthru/internal/config"
@@ -522,6 +523,10 @@ var get_by_hash_query = fmt.Sprintf(`SELECT %s FROM %s WHERE %s = ?`,
 )
 
 func GetByHash(hash string) (*TorrentInfo, error) {
+	hash = core.NormalizeMagnetHash(hash)
+	if hash == "" {
+		return nil, nil
+	}
 	row := db.QueryRow(get_by_hash_query, hash)
 
 	var tInfo TorrentInfo
@@ -601,6 +606,7 @@ var query_get_by_hashes = fmt.Sprintf(
 )
 
 func GetByHashes(hashes []string) (map[string]TorrentInfo, error) {
+	hashes = core.NormalizeMagnetHashes(hashes)
 	byHash := map[string]TorrentInfo{}
 
 	if len(hashes) == 0 {
@@ -821,16 +827,14 @@ func Upsert(items []TorrentInfoInsertData, category TorrentInfoCategory, discard
 		recordDataByHash := map[string]prevRecordData{}
 		args := make([]any, 0, 7*count)
 		for _, t := range cItems {
-			if _, seen := seenHash[t.Hash]; seen {
+			t.Hash = core.NormalizeMagnetHash(t.Hash)
+			if t.Hash == "" {
 				count--
 				continue
 			}
-			seenHash[t.Hash] = struct{}{}
 
-			if len(t.Hash) != 40 {
-				count--
-				continue
-			}
+			_, seen := seenHash[t.Hash]
+			seenHash[t.Hash] = struct{}{}
 
 			if t.Source.HasUntrustedData() {
 				count--
@@ -839,7 +843,7 @@ func Upsert(items []TorrentInfoInsertData, category TorrentInfoCategory, discard
 
 			tSource := string(t.Source)
 			hasVideoFile := t.Files.HasVideo()
-			shouldIgnoreFiles := t.Source == TorrentInfoSourceOffcloud || (t.Source == TorrentInfoSourcePremiumize && !hasVideoFile) || (!hasVideoFile && t.Files.HasMaliciousFile())
+			shouldIgnoreFiles := t.Source == TorrentInfoSourceOffcloud || (t.Source == TorrentInfoSourcePremiumize && !hasVideoFile)
 			if !shouldIgnoreFiles {
 				for _, f := range t.Files {
 					if !strings.HasPrefix(f.Path, "/") {
@@ -856,6 +860,12 @@ func Upsert(items []TorrentInfoInsertData, category TorrentInfoCategory, discard
 						File: f,
 					})
 				}
+			}
+
+			// Deduplicate torrent metadata after retaining each trusted entry's files.
+			if seen {
+				count--
+				continue
 			}
 
 			if shouldDiscardTorrentTitle(t.Hash, t.TorrentTitle) {
@@ -1600,6 +1610,7 @@ var exists_by_hash_query = fmt.Sprintf(
 )
 
 func ExistsByHash(hashes []string) (map[string]bool, error) {
+	hashes = core.NormalizeMagnetHashes(hashes)
 	exists := make(map[string]bool, len(hashes))
 	if len(hashes) == 0 {
 		return exists, nil
@@ -1753,6 +1764,7 @@ type BasicInfo struct {
 }
 
 func GetBasicInfoByHash(hashes []string) (map[string]BasicInfo, error) {
+	hashes = core.NormalizeMagnetHashes(hashes)
 	count := len(hashes)
 
 	basicInfos := make(map[string]BasicInfo, count)

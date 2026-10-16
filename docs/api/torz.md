@@ -167,6 +167,7 @@ Check torrent hashes.
 ```json
 {
   "data": {
+    "recheck_failed": false,
     "items": [
       {
         "hash": "string",
@@ -188,11 +189,13 @@ Check torrent hashes.
 }
 ```
 
-If `.status` is `cached`, `.files` will contain the list of files.
+`.files` contains file information when available. A `cached` result can still
+have an empty file list, including after a missing-file-list recheck.
 
 ::: info Notes
 
-- For `offcloud`, the `.files` list is always empty.
+- If `.recheck_failed` is `true`, an optional missing-file-list recheck failed and reusable results were retained.
+- For `offcloud`, the cache lookup requests file information and returns any supplied files.
 - If `.files[].index` is `-1`, the file index is unknown — rely on `.name` instead.
 - If `.files[].size` is `-1`, the file size is unknown.
   :::

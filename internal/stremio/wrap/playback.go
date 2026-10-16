@@ -10,6 +10,7 @@ import (
 	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/buddy"
 	"github.com/MunifTanjim/stremthru/internal/cache"
+	"github.com/MunifTanjim/stremthru/internal/config"
 	"github.com/MunifTanjim/stremthru/internal/logger"
 	"github.com/MunifTanjim/stremthru/internal/server"
 	"github.com/MunifTanjim/stremthru/internal/shared"
@@ -50,6 +51,7 @@ func handleStrem(w http.ResponseWriter, r *http.Request) {
 	log := server.GetReqCtx(r).Log
 
 	magnetHash := r.PathValue("magnetHash")
+	magnetHash = core.NormalizeMagnetHash(magnetHash)
 	fileName := r.PathValue("fileName")
 	fileIdx := -1
 	if idx, err := strconv.Atoi(r.PathValue("fileIdx")); err == nil {
@@ -70,12 +72,29 @@ func handleStrem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := r.URL.Query()
+	sid := query.Get("sid")
+	if sid == "" {
+		sid = "*"
+	}
 
 	s := ud.GetStoreByCode(query.Get("s"))
 	ctx.Store, ctx.StoreAuthToken = s.Store, s.AuthToken
 	storeCode := ctx.Store.GetName().Code()
+	fileRequest := stremio_shared.PlaybackFileRequest{Name: fileName, Index: fileIdx, StoreCode: storeCode, AllowMixed: config.AllowVideoTorrentsWithDisallowedFiles}
 
 	cacheKey := strings.Join([]string{ctx.ClientIP, string(storeCode), ctx.StoreAuthToken, magnetHash, strconv.Itoa(fileIdx), fileName, query.Encode()}, ":")
+
+	blocked, err := stremio_shared.StoredPlaybackIsBlocked(magnetHash, fileRequest)
+	if err != nil {
+		log.Error("failed to check retained playback evidence", "error", err, "hash", magnetHash, "sid", sid, "store.name", ctx.Store.GetName())
+		// Do not cache a transient database failure under the playback key.
+		redirectToStaticVideo(w, r, "", store_video.StoreVideoName500)
+		return
+	}
+	if blocked {
+		redirectToStaticVideo(w, r, cacheKey, store_video.StoreVideoNameNoMatchingFile)
+		return
+	}
 
 	stremLink := ""
 	if stremLinkCache.Get(cacheKey, &stremLink) {
@@ -130,11 +149,6 @@ func handleStrem(w http.ResponseWriter, r *http.Request) {
 			return strem, err
 		}
 
-		sid := query.Get("sid")
-		if sid == "" {
-			sid = "*"
-		}
-
 		var pattern *regexp.Regexp
 		if re := query.Get("re"); re != "" {
 			if pat, err := regexp.Compile(re); err == nil {
@@ -144,12 +158,13 @@ func handleStrem(w http.ResponseWriter, r *http.Request) {
 
 		shouldTagStream := strings.HasPrefix(sid, "tt") && !storeCode.HasUntrustedData()
 
-		videoFiles := []store.File{}
-		for i := range magnet.Files {
-			f := &magnet.Files[i]
-			if core.HasVideoExtension(f.Name) {
-				videoFiles = append(videoFiles, f)
-			}
+		rejectFiles := func(reason string) (*stremResult, error) {
+			buddy.TrackMagnet(ctx.Store, magnet.Hash, magnet.Name, magnet.Size, magnet.Private, magnet.Files, torrent_info.GetCategoryFromStremId(sid, ""), magnet.Status != store.MagnetStatusDownloaded, ctx.StoreAuthToken)
+			return &stremResult{error_level: logger.LevelWarn, error_log: reason + " (" + sid + " - " + magnet.Hash + ")", error_video: store_video.StoreVideoNameNoMatchingFile}, nil
+		}
+		videoFiles, validationErr := stremio_shared.ValidatePlaybackFiles(magnet.Files, fileRequest)
+		if validationErr != nil {
+			return rejectFiles(validationErr.Error())
 		}
 
 		var file store.File

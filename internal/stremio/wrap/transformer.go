@@ -17,8 +17,9 @@ type StreamTransformer struct {
 
 type WrappedStream struct {
 	*stremio.Stream
-	r              *stremio_transformer.StreamExtractorResult
-	noContentProxy bool
+	r                 *stremio_transformer.StreamExtractorResult
+	noContentProxy    bool
+	deferredTorzFiles bool
 }
 
 func (ws WrappedStream) IsSortable() bool {

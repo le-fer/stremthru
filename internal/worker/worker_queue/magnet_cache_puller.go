@@ -3,6 +3,7 @@ package worker_queue
 import (
 	"time"
 
+	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/config"
 )
 
@@ -23,6 +24,7 @@ var MagnetCachePullerQueue = WorkerQueue[MagnetCachePullerQueueItem]{
 		return item.StoreCode + ":" + item.SId
 	},
 	transform: func(item *MagnetCachePullerQueueItem) *MagnetCachePullerQueueItem {
+		item.Hash = core.NormalizeMagnetHash(item.Hash)
 		return item
 	},
 	Disabled: !config.PeerFlag.Lazy,

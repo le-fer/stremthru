@@ -177,7 +177,7 @@ type CheckMagnetParams struct {
 }
 
 func (c APIClient) CheckMagnet(params *CheckMagnetParams) (request.APIResponse[store.CheckMagnetData], error) {
-	params.Query = &url.Values{"magnet": params.Magnets}
+	params.Query = &url.Values{"magnet": core.NormalizeMagnetHashes(params.Magnets)}
 	params.Query.Set("client_ip", params.ClientIP)
 	if params.SId != "" {
 		params.Query.Set("sid", params.SId)
@@ -190,6 +190,9 @@ func (c APIClient) CheckMagnet(params *CheckMagnetParams) (request.APIResponse[s
 
 	response := &Response[store.CheckMagnetData]{}
 	res, err := c.Request("GET", "/v0/store/magnets/check", params, response)
+	for i := range response.Data.Items {
+		response.Data.Items[i].Hash = core.NormalizeMagnetHash(response.Data.Items[i].Hash)
+	}
 	return request.NewAPIResponse(res, response.Data), err
 }
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MunifTanjim/stremthru/internal/cache"
 	"github.com/MunifTanjim/stremthru/internal/db"
 	ts "github.com/MunifTanjim/stremthru/internal/torrent_stream"
 	"github.com/pressly/goose/v3"
@@ -14,6 +15,11 @@ import (
 
 func setupTestDB(t *testing.T) {
 	t.Helper()
+
+	previousRecords := prevRecordCache
+	prevRecordCache = cache.NewLRUCache[prevRecordData](&cache.CacheConfig{Name: "test:torrent_info:records"})
+	t.Cleanup(func() { prevRecordCache = previousRecords })
+	ts.ResetCachesForTesting(t.Cleanup)
 
 	sqlDB, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
@@ -68,4 +74,25 @@ func TestUpsertRecordsTorrentStreamBeforeReturning(t *testing.T) {
 	sid, err = queryStreamSId(t, hash, path)
 	require.NoError(t, err)
 	assert.Equal(t, "tt1234567", sid, "TagStremId did not tag the recorded stream")
+}
+
+func TestUpsertCanonicalizesAndValidatesHashes(t *testing.T) {
+	setupTestDB(t)
+	hash := strings.Repeat("a", 39) + "b"
+	items := []TorrentInfoInsertData{
+		{Hash: strings.ToUpper(hash), TorrentTitle: "Canonical", Source: TorrentInfoSourceTorrentio},
+		{Hash: strings.Repeat("z", 40), TorrentTitle: "Invalid", Source: TorrentInfoSourceTorrentio},
+		{Hash: strings.Repeat("a", 64), TorrentTitle: "Unsupported v2", Source: TorrentInfoSourceTorrentio},
+	}
+	require.NoError(t, Upsert(items, TorrentInfoCategoryMovie, true))
+
+	var canonical, uppercase, invalid, unsupported int
+	require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM torrent_info WHERE hash = ?", hash).Scan(&canonical))
+	require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM torrent_info WHERE hash = ?", strings.ToUpper(hash)).Scan(&uppercase))
+	require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM torrent_info WHERE hash = ?", strings.Repeat("z", 40)).Scan(&invalid))
+	require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM torrent_info WHERE hash = ?", strings.Repeat("a", 64)).Scan(&unsupported))
+	require.Equal(t, 1, canonical)
+	require.Zero(t, uppercase)
+	require.Zero(t, invalid)
+	require.Zero(t, unsupported)
 }

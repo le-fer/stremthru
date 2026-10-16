@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/buddy"
 	"github.com/MunifTanjim/stremthru/internal/config"
 	"github.com/MunifTanjim/stremthru/internal/kv"
@@ -20,6 +21,18 @@ import (
 	"github.com/MunifTanjim/stremthru/internal/util"
 	"github.com/MunifTanjim/stremthru/store"
 )
+
+func normalizeProviderHash(ctx *storecontext.Context, hash string, preserveV2 bool) (string, bool, error) {
+	if normalized := core.NormalizeMagnetHash(hash); normalized != "" {
+		return normalized, true, nil
+	}
+	if preserveV2 && core.IsMagnetHashV2(hash) {
+		return hash, false, nil
+	}
+	err := core.NewStoreError("store returned an invalid torrent hash")
+	err.StoreName = string(ctx.Store.GetName())
+	return "", false, err
+}
 
 func getUser(ctx *storecontext.Context) (*store.User, error) {
 	params := &store.GetUserParams{}
@@ -68,15 +81,35 @@ func checkMagnet(r *http.Request, ctx *storecontext.Context, magnets []string, s
 	if err != nil {
 		return nil, err
 	}
+	if data.RecheckError != nil {
+		log.Warn("failed to recheck missing file lists; retaining reusable results", "error", data.RecheckError, "store.name", ctx.Store.GetName())
+	}
 	if data.Items == nil {
 		data.Items = []store.CheckMagnetDataItem{}
 	}
+	copyData := *data
+	copyData.Items = append([]store.CheckMagnetDataItem{}, data.Items...)
+	data = &copyData
 	basicInfoByHash := <-basicInfoByHashCh
+	items := data.Items[:0]
+	invalidHashCount := 0
 	for i := range data.Items {
-		if info, ok := basicInfoByHash[data.Items[i].Hash]; ok {
+		hash, _, hashErr := normalizeProviderHash(ctx, data.Items[i].Hash, false)
+		if hashErr != nil {
+			invalidHashCount++
+			log.Trace("store returned invalid hash in magnet check", "hash", data.Items[i].Hash, "store.name", ctx.Store.GetName())
+			continue
+		}
+		data.Items[i].Hash = hash
+		if info, ok := basicInfoByHash[hash]; ok {
 			data.Items[i].Name = info.TorrentTitle
 		}
+		items = append(items, data.Items[i])
 	}
+	if invalidHashCount > 0 {
+		log.Warn("store returned invalid hashes in magnet check", "invalid_hash_count", invalidHashCount, "store.name", ctx.Store.GetName())
+	}
+	data.Items = items
 	return data, err
 }
 
@@ -163,11 +196,6 @@ func handleStoreMagnetsCheck(w http.ResponseWriter, r *http.Request) {
 
 	ctx := storecontext.Get(r)
 	data, err := checkMagnet(r, ctx, magnets, sid, queryParams.Get("local_only") != "")
-	if err == nil && data != nil {
-		for _, item := range data.Items {
-			item.Hash = strings.ToLower(item.Hash)
-		}
-	}
 	SendResponse(w, r, 200, data, err)
 }
 
@@ -193,10 +221,31 @@ func listMagnets(ctx *storecontext.Context, r *http.Request) (*store.ListMagnets
 	params.APIKey = ctx.StoreAuthToken
 	data, err := ctx.Store.ListMagnets(params)
 
-	if err == nil {
-		if data.Items == nil {
-			data.Items = []store.ListMagnetsDataItem{}
+	if err == nil && data != nil {
+		// Some adapters return cached slices. Normalize a private copy before
+		// asynchronous recording or response serialization can read it.
+		copyData := *data
+		copyData.Items = append([]store.ListMagnetsDataItem{}, data.Items...)
+		data = &copyData
+		items := data.Items[:0]
+		invalidHashCount := 0
+		reqCtx := server.GetReqCtxFromContext(r.Context())
+		for i := range data.Items {
+			hash, _, hashErr := normalizeProviderHash(ctx, data.Items[i].Hash, true)
+			if hashErr != nil {
+				invalidHashCount++
+				if reqCtx != nil && reqCtx.Log != nil {
+					reqCtx.Log.Trace("store returned invalid hash in magnet list", "hash", data.Items[i].Hash, "store.name", ctx.Store.GetName())
+				}
+				continue
+			}
+			data.Items[i].Hash = hash
+			items = append(items, data.Items[i])
 		}
+		if invalidHashCount > 0 && reqCtx != nil && reqCtx.Log != nil {
+			reqCtx.Log.Warn("store returned invalid hashes in magnet list", "invalid_hash_count", invalidHashCount, "store.name", ctx.Store.GetName())
+		}
+		data.Items = items
 		go store_util.RecordTorrentInfoFromListMagnets(ctx.Store.GetName().Code(), data.Items)
 	}
 
@@ -211,11 +260,6 @@ func handleStoreMagnetsList(w http.ResponseWriter, r *http.Request) {
 
 	ctx := storecontext.Get(r)
 	data, err := listMagnets(ctx, r)
-	if err == nil && data != nil {
-		for _, item := range data.Items {
-			item.Hash = strings.ToLower(item.Hash)
-		}
-	}
 	SendResponse(w, r, 200, data, err)
 }
 
@@ -234,6 +278,12 @@ func addMagnet(ctx *storecontext.Context, magnet string, torrent *multipart.File
 		}
 	}
 	data, err := ctx.Store.AddMagnet(params)
+	if err == nil && data != nil {
+		data.Hash, _, err = normalizeProviderHash(ctx, data.Hash, false)
+		if err != nil {
+			data = nil
+		}
+	}
 	torz.TrackAddMagnet(ctx, magnet, data, err)
 	return data, err
 }
@@ -312,7 +362,6 @@ func handleStoreMagnetAdd(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err == nil && data != nil {
-		data.Hash = strings.ToLower(data.Hash)
 		if data.Files == nil {
 			data.Files = []store.MagnetFile{}
 		}
@@ -342,10 +391,18 @@ func getMagnet(ctx *storecontext.Context, magnetId string) (*store.GetMagnetData
 		params.ClientIP = ctx.ClientIP
 	}
 	data, err := ctx.Store.GetMagnet(params)
-	if err == nil {
+	if err != nil || data == nil {
+		return data, err
+	}
+	var supportedV1 bool
+	data.Hash, supportedV1, err = normalizeProviderHash(ctx, data.Hash, true)
+	if err != nil {
+		return nil, err
+	}
+	if supportedV1 {
 		buddy.TrackMagnet(ctx.Store, data.Hash, data.Name, data.Size, data.Private, data.Files, "", data.Status != store.MagnetStatusDownloaded, ctx.StoreAuthToken)
 	}
-	return data, err
+	return data, nil
 }
 
 func handleStoreMagnetGet(w http.ResponseWriter, r *http.Request) {
@@ -362,9 +419,6 @@ func handleStoreMagnetGet(w http.ResponseWriter, r *http.Request) {
 
 	ctx := storecontext.Get(r)
 	data, err := getMagnet(ctx, magnetId)
-	if err == nil && data != nil {
-		data.Hash = strings.ToLower(data.Hash)
-	}
 	SendResponse(w, r, 200, data, err)
 }
 

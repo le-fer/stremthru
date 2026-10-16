@@ -56,6 +56,7 @@ func (t *Torz) HasMissingData() bool {
 }
 
 func (t *Torz) EnsureMagnet(ctx context.Context) error {
+	t.Hash = core.NormalizeMagnetHash(t.Hash)
 	if !t.HasMissingData() {
 		return nil
 	}
@@ -66,7 +67,7 @@ func (t *Torz) EnsureMagnet(ctx context.Context) error {
 
 	cachedTorz := torzFileCached{}
 	if torzFileCache.Get(t.SourceLink, &cachedTorz) {
-		t.Hash = cachedTorz.Hash
+		t.Hash = core.NormalizeMagnetHash(cachedTorz.Hash)
 		t.MagnetLink = cachedTorz.MagnetLink
 		if cachedTorz.Private {
 			t.Private = true
@@ -150,7 +151,7 @@ func (t *Torz) EnsureMagnet(ctx context.Context) error {
 func TorzFromChannelItem(o *znab.ChannelItem, attrs znab.ChannelItemAttrs) *Torz {
 	t := &Torz{}
 	t.GUID = o.GUID
-	t.Hash = strings.ToLower(attrs.Get(znab.TorznabAttrNameInfoHash))
+	t.Hash = core.NormalizeMagnetHash(attrs.Get(znab.TorznabAttrNameInfoHash))
 	t.Title = o.Title
 	if size, err := strconv.ParseInt(attrs.Get(znab.TorznabAttrNameSize), 10, 64); err == nil && size > 0 {
 		t.Size = size

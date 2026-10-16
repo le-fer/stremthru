@@ -1,13 +1,17 @@
 package debrider
 
 import (
+	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/buddy"
 	"github.com/MunifTanjim/stremthru/internal/cache"
+	"github.com/MunifTanjim/stremthru/internal/config"
+	store_util "github.com/MunifTanjim/stremthru/internal/store/util"
 	"github.com/MunifTanjim/stremthru/internal/torrent_stream"
 	"github.com/MunifTanjim/stremthru/internal/util"
 	"github.com/MunifTanjim/stremthru/store"
@@ -144,6 +148,54 @@ func (s *StoreClient) AddMagnet(params *store.AddMagnetParams) (*store.AddMagnet
 
 }
 
+// mapLinkAvailabilityResults prefers explicit identities over positions. Hashless
+// entries retain upstream's positional handling only for a complete response
+// whose explicit identities agree with that ordering. Sparse identified results
+// are usable; absent results say nothing about the remaining hashes.
+func mapLinkAvailabilityResults(hashes []string, results []CheckLinkAvailabilityDataItem) (map[string]CheckLinkAvailabilityDataItem, error) {
+	requested := make(map[string]struct{}, len(hashes))
+	for _, hash := range hashes {
+		requested[hash] = struct{}{}
+	}
+	positional := len(results) == len(hashes)
+	hashless := len(results) == 0
+	for i, detail := range results {
+		if detail.Hash == "" {
+			hashless = true
+			continue
+		}
+		hash := core.NormalizeMagnetHash(detail.Hash)
+		if _, found := requested[hash]; hash == "" || !found {
+			return nil, fmt.Errorf("invalid link availability response: invalid or unrequested hash")
+		}
+		if i >= len(hashes) || hash != hashes[i] {
+			positional = false
+		}
+	}
+	if hashless && !positional {
+		return nil, fmt.Errorf("invalid link availability response: ambiguous identities (%d results for %d magnets)", len(results), len(hashes))
+	}
+	byHash := make(map[string]CheckLinkAvailabilityDataItem, len(results))
+	for i, detail := range results {
+		hash := core.NormalizeMagnetHash(detail.Hash)
+		if detail.Hash == "" {
+			hash = hashes[i]
+		}
+		if previous, found := byHash[hash]; found {
+			if previous.Cached != detail.Cached {
+				return nil, fmt.Errorf("invalid link availability response: conflicting cached statuses")
+			}
+			previous.Files = append(previous.Files, detail.Files...)
+			byHash[hash] = previous
+		} else {
+			detail.Hash = hash
+			detail.Files = slices.Clone(detail.Files)
+			byHash[hash] = detail
+		}
+	}
+	return byHash, nil
+}
+
 func (s *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.CheckMagnetData, error) {
 	totalMagnets := len(params.Magnets)
 
@@ -159,14 +211,18 @@ func (s *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 		hashes[i] = magnet.Hash
 	}
 
-	foundItemByHash := map[string]store.CheckMagnetDataItem{}
-
+	var partition store_util.CheckMagnetItemsPartition
 	if data, err := buddy.CheckMagnet(s, hashes, params.GetAPIKey(s.client.apiKey), params.ClientIP, params.SId, true); err != nil {
 		return nil, err
 	} else {
-		for _, item := range data.Items {
-			foundItemByHash[item.Hash] = item
+		if data.RecheckError != nil {
+			return data, nil
 		}
+		partition = store_util.PartitionCheckMagnetItems(store_util.PartitionCheckMagnetItemsParams{
+			Items:                   data.Items,
+			RecheckMissingFileLists: config.StoreRecheckMissingFileLists,
+			LocalOnly:               params.LocalOnly,
+		})
 	}
 
 	if params.LocalOnly {
@@ -175,7 +231,7 @@ func (s *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 		}
 
 		for _, hash := range hashes {
-			if item, ok := foundItemByHash[hash]; ok {
+			if item, ok := partition.Found[hash]; ok {
 				data.Items = append(data.Items, item)
 			}
 		}
@@ -185,7 +241,7 @@ func (s *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 	missingHashes := []string{}
 	missingLinks := []string{}
 	for _, hash := range hashes {
-		if _, ok := foundItemByHash[hash]; !ok {
+		if _, ok := partition.Found[hash]; !ok {
 			magnet := magnetByHash[hash]
 			missingHashes = append(missingHashes, magnet.Hash)
 			missingLinks = append(missingLinks, magnet.Link)
@@ -201,11 +257,11 @@ func (s *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 		})
 		stats.Record(s.Name, "check_torz", time.Since(start), err != nil)
 		if err != nil {
-			return nil, err
+			return partition.Restore(hashes, err)
 		}
-		for i, detail := range res.Data.Result {
-			hash := missingHashes[i]
-			ldByHash[hash] = detail
+		ldByHash, err = mapLinkAvailabilityResults(missingHashes, res.Data.Result)
+		if err != nil {
+			return partition.Restore(hashes, err)
 		}
 	}
 	data := &store.CheckMagnetData{
@@ -214,9 +270,15 @@ func (s *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 	tInfos := []buddy.TorrentInfoInput{}
 	source := string(s.GetName().Code())
 	for _, hash := range hashes {
-		if item, ok := foundItemByHash[hash]; ok {
+		if item, ok := partition.Found[hash]; ok {
 			data.Items = append(data.Items, item)
 			continue
+		}
+		if _, resolved := ldByHash[hash]; !resolved {
+			if item, reusable := partition.Reusable[hash]; reusable {
+				data.Items = append(data.Items, item)
+				continue
+			}
 		}
 
 		magnet := magnetByHash[hash]

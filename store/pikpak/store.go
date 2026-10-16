@@ -120,6 +120,10 @@ func (s *StoreClient) waitForTaskComplete(ctx Ctx, taskId string, maxRetry int, 
 }
 
 func (s *StoreClient) getFileByMagnetHash(ctx Ctx, hash string) (*File, error) {
+	hash = core.NormalizeMagnetHash(hash)
+	if hash == "" {
+		return nil, nil
+	}
 	myPackFolder, err := s.getMyPackFolder(ctx)
 	if err != nil {
 		return nil, err
@@ -139,7 +143,8 @@ func (s *StoreClient) getFileByMagnetHash(ctx Ctx, hash string) (*File, error) {
 	}
 	for i := range res.Data.Files {
 		f := &res.Data.Files[i]
-		if strings.Contains(f.Params.URL, hash) {
+		magnet, err := core.ParseMagnetLink(f.Params.URL)
+		if err == nil && magnet.Hash == hash {
 			return f, nil
 		}
 	}

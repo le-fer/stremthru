@@ -1,6 +1,7 @@
 package easydebrid
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -8,6 +9,8 @@ import (
 
 	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/buddy"
+	"github.com/MunifTanjim/stremthru/internal/config"
+	store_util "github.com/MunifTanjim/stremthru/internal/store/util"
 	"github.com/MunifTanjim/stremthru/internal/torrent_stream"
 	"github.com/MunifTanjim/stremthru/internal/util"
 	"github.com/MunifTanjim/stremthru/store"
@@ -153,14 +156,18 @@ func (s *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 		hashes[i] = magnet.Hash
 	}
 
-	foundItemByHash := map[string]store.CheckMagnetDataItem{}
-
+	var partition store_util.CheckMagnetItemsPartition
 	if data, err := buddy.CheckMagnet(s, hashes, params.GetAPIKey(s.client.apiKey), params.ClientIP, params.SId, true); err != nil {
 		return nil, err
 	} else {
-		for _, item := range data.Items {
-			foundItemByHash[item.Hash] = item
+		if data.RecheckError != nil {
+			return data, nil
 		}
+		partition = store_util.PartitionCheckMagnetItems(store_util.PartitionCheckMagnetItemsParams{
+			Items:                   data.Items,
+			RecheckMissingFileLists: config.StoreRecheckMissingFileLists,
+			LocalOnly:               params.LocalOnly,
+		})
 	}
 
 	if params.LocalOnly {
@@ -169,7 +176,7 @@ func (s *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 		}
 
 		for _, hash := range hashes {
-			if item, ok := foundItemByHash[hash]; ok {
+			if item, ok := partition.Found[hash]; ok {
 				data.Items = append(data.Items, item)
 			}
 		}
@@ -179,7 +186,7 @@ func (s *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 	missingHashes := []string{}
 	missingLinks := []string{}
 	for _, hash := range hashes {
-		if _, ok := foundItemByHash[hash]; !ok {
+		if _, ok := partition.Found[hash]; !ok {
 			magnet := magnetByHash[hash]
 			missingHashes = append(missingHashes, magnet.Hash)
 			missingLinks = append(missingLinks, magnet.Link)
@@ -195,7 +202,10 @@ func (s *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 		})
 		stats.Record(s.Name, "check_torz", time.Since(start), err != nil)
 		if err != nil {
-			return nil, err
+			return partition.Restore(hashes, err)
+		}
+		if len(res.Data.Result) != len(missingHashes) {
+			return partition.Restore(hashes, fmt.Errorf("invalid link details response: got %d results for %d magnets", len(res.Data.Result), len(missingHashes)))
 		}
 		for i, detail := range res.Data.Result {
 			hash := missingHashes[i]
@@ -208,7 +218,7 @@ func (s *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 	tInfos := []buddy.TorrentInfoInput{}
 	source := string(s.GetName().Code())
 	for _, hash := range hashes {
-		if item, ok := foundItemByHash[hash]; ok {
+		if item, ok := partition.Found[hash]; ok {
 			data.Items = append(data.Items, item)
 			continue
 		}

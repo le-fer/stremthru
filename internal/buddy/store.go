@@ -1,6 +1,7 @@
 package buddy
 
 import (
+	"errors"
 	"regexp"
 	"slices"
 	"sync"
@@ -31,6 +32,10 @@ var Peer = peer.NewAPIClient(&peer.APIClientConfig{
 var peerLog = logger.Scoped("buddy:upstream")
 
 func TrackMagnet(s store.Store, hash string, name string, size int64, private bool, files []store.MagnetFile, tInfoCategory torrent_info.TorrentInfoCategory, cacheMiss bool, storeToken string) {
+	hash = core.NormalizeMagnetHash(hash)
+	if hash == "" {
+		return
+	}
 	storeCode := s.GetName().Code()
 	if storeCode.HasUntrustedData() {
 		return
@@ -121,14 +126,30 @@ func BulkTrackMagnet(s store.Store, tInfos []TorrentInfoInput, cached map[string
 		return
 	}
 
+	// Canonical keys must agree across file evidence and cache status.
+	normalizedCached := make(map[string]bool, len(cached))
+	for hash, value := range cached {
+		if hash = core.NormalizeMagnetHash(hash); hash != "" {
+			normalizedCached[hash] = normalizedCached[hash] || value
+		}
+	}
+	cached = normalizedCached
+	normalizedInfos := tInfos[:0]
+	for _, info := range tInfos {
+		info.Hash = core.NormalizeMagnetHash(info.Hash)
+		if info.Hash != "" {
+			normalizedInfos = append(normalizedInfos, info)
+		}
+	}
+	tInfos = normalizedInfos
 	tInfoSource := torrent_info.TorrentInfoSource(storeCode)
-	filesByHash := map[string]torrent_stream.Files{}
+	filesByHash := make(map[string]torrent_stream.Files, len(tInfos))
 	for i := range tInfos {
 		tInfo := &tInfos[i]
 		if tInfo.Source == "" {
 			tInfo.Source = tInfoSource
 		}
-		filesByHash[tInfo.Hash] = tInfo.Files
+		mergeFilesByHash(filesByHash, tInfo.Hash, tInfo.Files)
 	}
 	magnet_cache.BulkTouch(s.GetName().Code(), filesByHash, cached, true)
 	go torrent_info.Upsert(tInfos, tInfoCategory, storeCode != store.StoreCodeRealDebrid)
@@ -174,13 +195,14 @@ func CheckMagnet(s store.Store, hashes []string, storeToken string, clientIp str
 		Items: []store.CheckMagnetDataItem{},
 	}
 
+	hashes = core.NormalizeMagnetHashes(hashes)
 	mcs, err := magnet_cache.GetByHashes(s.GetName().Code(), hashes, sid)
 	if err != nil {
 		return nil, err
 	}
 	mcByHash := map[string]magnet_cache.MagnetCache{}
 	for _, mc := range mcs {
-		mcByHash[mc.Hash] = mc
+		mcByHash[core.NormalizeMagnetHash(mc.Hash)] = mc
 	}
 
 	magnetByHash := map[string]core.MagnetLink{}
@@ -197,11 +219,10 @@ func CheckMagnet(s store.Store, hashes []string, storeToken string, clientIp str
 				Hash:   magnet.Hash,
 				Magnet: magnet.Link,
 				Status: store.MagnetStatusUnknown,
-				Files:  []store.MagnetFile{},
+				Files:  mc.Files.ToStoreMagnetFiles(magnet.Hash),
 			}
 			if mc.IsCached {
 				item.Status = store.MagnetStatusCached
-				item.Files = mc.Files.ToStoreMagnetFiles(magnet.Hash)
 			}
 			data.Items = append(data.Items, item)
 		} else {
@@ -228,51 +249,48 @@ func CheckMagnet(s store.Store, hashes []string, storeToken string, clientIp str
 			return data, nil
 		} else {
 			buddyLog.Info("check magnet", "store.name", s.GetName(), "hash_count", len(staleOrMissingHashes), "duration", duration)
-			filesByHash := map[string]torrent_stream.Files{}
-			cached := map[string]bool{}
+			filesByHash := make(map[string]torrent_stream.Files, len(res.Data.Items))
+			evidenceByHash := make(map[string]torrent_stream.Files, len(res.Data.Items))
+			cached := make(map[string]bool, len(res.Data.Items))
 			for _, item := range res.Data.Items {
+				item.Hash = core.NormalizeMagnetHash(item.Hash)
+				if item.Hash == "" {
+					continue
+				}
 				res_item := store.CheckMagnetDataItem{
 					Hash:   item.Hash,
 					Magnet: item.Magnet,
 					Status: item.Status,
 				}
-				res_files := []store.MagnetFile{}
-				files := torrent_stream.Files{}
-				if item.Status == store.MagnetStatusCached {
-					cached[item.Hash] = true
-					seenByName := map[string]struct{}{}
-					for _, f := range item.Files {
-						key := f.Path
-						if key == "" {
-							key = f.Name
-						}
-						if _, seen := seenByName[key]; seen {
-							buddyLog.Info("found duplicate file", "hash", item.Hash, "filename", f.Name)
-							continue
-						}
-						seenByName[key] = struct{}{}
-						res_files = append(res_files, store.MagnetFile{
-							Idx:    f.Idx,
-							Path:   f.Path,
-							Name:   f.Name,
-							Size:   f.Size,
-							Source: f.Source,
-						})
-						files = append(files, torrent_stream.File{
-							Idx:    f.Idx,
-							Path:   f.Path,
-							Name:   f.Name,
-							Size:   f.Size,
-							SId:    f.SId,
-							Source: f.Source,
-						})
+				res_files := make([]store.MagnetFile, 0, len(item.Files))
+				files := make(torrent_stream.Files, 0, len(item.Files))
+				// Different supplied names for one path must reach validation,
+				// regardless of cache status.
+				seenFiles := make(map[[2]string]struct{}, len(item.Files))
+				for _, f := range item.Files {
+					key := [2]string{f.Path, f.Name}
+					if _, seen := seenFiles[key]; seen {
+						buddyLog.Info("found duplicate file", "hash", item.Hash, "filename", f.Name)
+						continue
 					}
+					seenFiles[key] = struct{}{}
+					source := f.Source
+					if source == "" {
+						source = string(s.GetName().Code())
+					}
+					res_files = append(res_files, store.MagnetFile{Idx: f.Idx, Path: f.Path, Name: f.Name, Size: f.Size, Source: source})
+					files = append(files, torrent_stream.File{Idx: f.Idx, Path: f.Path, Name: f.Name, Size: f.Size, SId: f.SId, Source: source})
 				}
 				res_item.Files = res_files
 				data.Items = append(data.Items, res_item)
-				filesByHash[item.Hash] = files
+				if item.Status == store.MagnetStatusCached {
+					cached[item.Hash] = true
+					mergeFilesByHash(filesByHash, item.Hash, files)
+				} else if len(files) > 0 {
+					mergeFilesByHash(evidenceByHash, item.Hash, files)
+				}
 			}
-			go magnet_cache.BulkTouch(s.GetName().Code(), filesByHash, cached, false)
+			go persistCheckedMagnetEvidence(s.GetName().Code(), filesByHash, cached, evidenceByHash)
 			return data, nil
 		}
 	}
@@ -298,7 +316,8 @@ func CheckMagnet(s store.Store, hashes []string, storeToken string, clientIp str
 
 		var mu sync.Mutex
 		var wg sync.WaitGroup
-		filesByHash := map[string]torrent_stream.Files{}
+		filesByHash := make(map[string]torrent_stream.Files, len(staleOrMissingHashes))
+		evidenceByHash := make(map[string]torrent_stream.Files, len(staleOrMissingHashes))
 		for cHashes := range slices.Chunk(staleOrMissingHashes, 500) {
 			wg.Go(func() {
 
@@ -322,41 +341,65 @@ func CheckMagnet(s store.Store, hashes []string, storeToken string, clientIp str
 					defer mu.Unlock()
 
 					peerLog.Info("check magnet", "store.name", s.GetName(), "hash_count", len(cHashes), "duration", duration)
+					if res.Data.RecheckError != nil {
+						peerLog.Warn("peer failed to recheck missing file lists; retaining reusable results", "store.name", s.GetName(), "error", res.Data.RecheckError)
+						data.RecheckError = errors.Join(data.RecheckError, res.Data.RecheckError)
+					}
 					for _, item := range res.Data.Items {
-						files := torrent_stream.Files{}
-						if item.Status == store.MagnetStatusCached {
-							seenByName := map[string]struct{}{}
-							for _, f := range item.Files {
-								key := f.Path
-								if key == "" {
-									key = f.Name
-								}
-								if _, seen := seenByName[key]; seen {
-									peerLog.Info("found duplicate file", "hash", item.Hash, "filename", f.Name)
-									continue
-								}
-								seenByName[key] = struct{}{}
-								files = append(files, torrent_stream.File{
-									Idx:       f.Idx,
-									Path:      f.Path,
-									Name:      f.Name,
-									Size:      f.Size,
-									Source:    f.Source,
-									VideoHash: f.VideoHash,
-									MediaInfo: f.MediaInfo,
-								})
-							}
+						item.Hash = core.NormalizeMagnetHash(item.Hash)
+						if item.Hash == "" {
+							continue
 						}
-						filesByHash[item.Hash] = files
+						files := make(torrent_stream.Files, 0, len(item.Files))
+						cleanFiles := make([]store.MagnetFile, 0, len(item.Files))
+						// Preserve the same path/name distinctions as Buddy responses.
+						seenFiles := make(map[[2]string]struct{}, len(item.Files))
+						for _, f := range item.Files {
+							key := [2]string{f.Path, f.Name}
+							if _, seen := seenFiles[key]; seen {
+								peerLog.Info("found duplicate file", "hash", item.Hash, "filename", f.Name)
+								continue
+							}
+							seenFiles[key] = struct{}{}
+							if f.Source == "" {
+								f.Source = string(s.GetName().Code())
+							}
+							cleanFiles = append(cleanFiles, f)
+							files = append(files, torrent_stream.File{Idx: f.Idx, Path: f.Path, Name: f.Name, Size: f.Size, Source: f.Source, VideoHash: f.VideoHash, MediaInfo: f.MediaInfo})
+						}
+						item.Files = cleanFiles
+						if item.Status == store.MagnetStatusCached {
+							mergeFilesByHash(filesByHash, item.Hash, files)
+						} else if len(files) > 0 {
+							mergeFilesByHash(evidenceByHash, item.Hash, files)
+						}
 						data.Items = append(data.Items, item)
 					}
 				}
 			})
 		}
 		wg.Wait()
-		go magnet_cache.BulkTouch(s.GetName().Code(), filesByHash, nil, false)
+		go persistCheckedMagnetEvidence(s.GetName().Code(), filesByHash, nil, evidenceByHash)
 		return data, nil
 	}
 
 	return data, nil
+}
+
+func mergeFilesByHash(filesByHash map[string]torrent_stream.Files, hash string, files torrent_stream.Files) {
+	if previous, found := filesByHash[hash]; found {
+		merged := make(torrent_stream.Files, 0, len(previous)+len(files))
+		merged = append(merged, previous...)
+		merged = append(merged, files...)
+		filesByHash[hash] = merged
+	} else {
+		filesByHash[hash] = files
+	}
+}
+
+func persistCheckedMagnetEvidence(storeCode store.StoreCode, filesByHash map[string]torrent_stream.Files, cached map[string]bool, evidenceByHash map[string]torrent_stream.Files) {
+	magnet_cache.BulkTouch(storeCode, filesByHash, cached, false)
+	if len(evidenceByHash) > 0 {
+		torrent_stream.TrackFiles(storeCode, evidenceByHash)
+	}
 }
