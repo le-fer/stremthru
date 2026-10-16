@@ -17,6 +17,8 @@ type StreamTransformer struct {
 
 type WrappedStream struct {
 	*stremio.Stream
+	deferredTorzFiles bool
+
 	r              *stremio_transformer.StreamExtractorResult
 	noContentProxy bool
 }

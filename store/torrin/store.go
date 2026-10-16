@@ -64,6 +64,9 @@ func (s *StoreClient) GetUser(params *store.GetUserParams) (*store.User, error) 
 func (s *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.CheckMagnetData, error) {
 	ctx := params.Ctx
 	query := url.Values{"magnet": params.Magnets}
+	if params.LocalOnly {
+		query.Set("local_only", "1")
+	}
 	if params.SId != "" {
 		query.Set("sid", params.SId)
 	}

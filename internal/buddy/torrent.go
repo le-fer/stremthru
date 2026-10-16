@@ -57,13 +57,17 @@ func PullTorrentsByStremId(sid string, originInstanceId string) []string {
 	count := len(res.Data.Items)
 	pullPeerLog.Info("pulled torrents", "duration", duration, "sid", cleanSId, "count", count)
 
-	hashes := make([]string, count)
-	items := make([]ti.TorrentInfoInsertData, count)
+	hashes := make([]string, 0, count)
+	items := make([]ti.TorrentInfoInsertData, 0, count)
 	for i := range res.Data.Items {
 		data := &res.Data.Items[i]
-		hashes[i] = data.Hash
-		items[i] = ti.TorrentInfoInsertData{
-			Hash:         data.Hash,
+		hash := core.NormalizeMagnetHash(data.Hash)
+		if hash == "" {
+			continue
+		}
+		hashes = append(hashes, hash)
+		items = append(items, ti.TorrentInfoInsertData{
+			Hash:         hash,
 			TorrentTitle: data.TorrentTitle,
 			Size:         data.Size,
 			Indexer:      data.Indexer,
@@ -73,7 +77,7 @@ func PullTorrentsByStremId(sid string, originInstanceId string) []string {
 			Seeders:      data.Seeders,
 			Leechers:     data.Leechers,
 			Private:      data.Private,
-		}
+		})
 	}
 	ti.Upsert(items, "", false)
 	go tss.MarkPulled(cleanSId)

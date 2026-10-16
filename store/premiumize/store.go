@@ -2,6 +2,7 @@ package premiumize
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"path"
@@ -13,7 +14,9 @@ import (
 	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/buddy"
 	"github.com/MunifTanjim/stremthru/internal/cache"
+	"github.com/MunifTanjim/stremthru/internal/config"
 	"github.com/MunifTanjim/stremthru/internal/request"
+	store_util "github.com/MunifTanjim/stremthru/internal/store/util"
 	"github.com/MunifTanjim/stremthru/internal/torrent_info"
 	"github.com/MunifTanjim/stremthru/internal/torrent_stream"
 	"github.com/MunifTanjim/stremthru/internal/util"
@@ -188,12 +191,12 @@ func (c *StoreClient) GetUser(params *store.GetUserParams) (*store.User, error) 
 	return data, err
 }
 
-func (c *StoreClient) getCachedMagnetFiles(apiKey string, magnet string, includeLink bool) ([]store.MagnetFile, error) {
+func (c *StoreClient) getCachedMagnetFiles(apiKey string, magnet string, includeLink bool, info stats.CallInfo) ([]store.MagnetFile, error) {
 	params := &CreateDirectDownloadLinkParams{Src: magnet}
 	params.APIKey = apiKey
 	start := time.Now()
 	res, err := c.client.CreateDirectDownloadLink(params)
-	stats.Record(c.Name, "generate_torz_link", time.Since(start), err != nil)
+	stats.RecordWithInfo(c.Name, "generate_torz_link", time.Since(start), err != nil, info)
 	if err != nil {
 		return nil, err
 	}
@@ -236,24 +239,28 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 		hashes = append(hashes, magnet.Hash)
 	}
 
-	foundItemByHash := map[string]store.CheckMagnetDataItem{}
+	partition := store_util.CheckMagnetItemsPartition{Found: map[string]store.CheckMagnetDataItem{}, Reusable: map[string]store.CheckMagnetDataItem{}}
 
 	if !includeLinkAndPath {
 		if data, err := buddy.CheckMagnet(c, hashes, params.GetAPIKey(c.client.apiKey), params.ClientIP, params.SId, true); err != nil {
 			return nil, err
 		} else {
-			for _, item := range data.Items {
-				foundItemByHash[item.Hash] = item
-			}
+			partition = store_util.PartitionCheckMagnetItems(store_util.PartitionCheckMagnetItemsParams{
+				Items:                   data.Items,
+				RecheckError:            data.RecheckError,
+				RecheckMissingFileLists: config.StoreRecheckMissingFileLists,
+				LocalOnly:               params.LocalOnly,
+			})
 		}
 
 		if params.LocalOnly {
 			data := &store.CheckMagnetData{
-				Items: []store.CheckMagnetDataItem{},
+				RecheckError: partition.RecheckError,
+				Items:        []store.CheckMagnetDataItem{},
 			}
 
 			for _, hash := range hashes {
-				if item, ok := foundItemByHash[hash]; ok {
+				if item, ok := partition.Found[hash]; ok {
 					data.Items = append(data.Items, item)
 				}
 			}
@@ -262,17 +269,17 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 	}
 
 	for _, hash := range hashes {
-		if _, ok := foundItemByHash[hash]; !ok {
+		if _, ok := partition.Found[hash]; !ok {
 			missingHashes = append(missingHashes, hash)
 		}
 	}
 
 	itemByHash := map[string]store.AddMagnetData{}
+	recheckError := partition.RecheckError
 	if len(missingHashes) > 0 {
 		chunkCount := len(missingHashes)/100 + 1
 		cItems := make([][]store.AddMagnetData, chunkCount)
 		errs := make([]error, chunkCount)
-		hasError := false
 
 		var wg sync.WaitGroup
 		for i, cMissingHashes := range slices.Collect(slices.Chunk(missingHashes, 100)) {
@@ -283,9 +290,15 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 				ccParams.APIKey = params.APIKey
 				start := time.Now()
 				res, err := c.client.CheckCache(ccParams)
-				stats.Record(c.Name, "check_torz", time.Since(start), err != nil)
+				if err == nil && (len(res.Data.Response) != len(ccParams.Items) || len(res.Data.Filename) != len(ccParams.Items) || len(res.Data.Filesize) != len(ccParams.Items)) {
+					err = fmt.Errorf(
+						"invalid cache response: got response=%d filename=%d filesize=%d for %d magnets",
+						len(res.Data.Response), len(res.Data.Filename), len(res.Data.Filesize), len(ccParams.Items),
+					)
+				}
+				info := stats.CheckCall(partition.FileListRecheckCount(cMissingHashes, params.FileListRecheckHashes), len(cMissingHashes))
+				stats.RecordWithInfo(c.Name, "check_torz", time.Since(start), err != nil, info)
 				if err != nil {
-					hasError = true
 					errs[i] = err
 					return
 				}
@@ -294,7 +307,6 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 				for idx, is_cached := range res.Data.Response {
 					magnet, err := core.ParseMagnetLink(ccParams.Items[idx])
 					if err != nil {
-						hasError = true
 						errs[i] = err
 						return
 					}
@@ -314,9 +326,13 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 					if is_cached {
 						item.Status = store.MagnetStatusCached
 
-						files, err := c.getCachedMagnetFiles(params.APIKey, item.Magnet, includeLinkAndPath)
+						fileInfo := stats.CallInfo{}
+						if partition.IsFileListRecheck(item.Hash, params.FileListRecheckHashes) {
+							// This is another API call, not another cache-check hash submission.
+							fileInfo.Kind = stats.CallRecheckOnly
+						}
+						files, err := c.getCachedMagnetFiles(params.APIKey, item.Magnet, includeLinkAndPath, fileInfo)
 						if err != nil {
-							hasError = true
 							errs[i] = err
 							return
 						}
@@ -324,30 +340,43 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 					}
 
 					items = append(items, item)
+					// Preserve completed answers if a later item in the chunk fails.
+					cItems[i] = items
 				}
-
-				cItems[i] = items
 			})
 		}
 		wg.Wait()
 
-		if hasError {
-			return nil, errors.Join(errs...)
+		if lookupError := errors.Join(errs...); lookupError != nil {
+			if !partition.Rechecking && partition.RecheckError == nil {
+				return nil, lookupError
+			}
+			recheckError = errors.Join(recheckError, lookupError)
 		}
 
 		for _, items := range cItems {
 			for _, item := range items {
-				itemByHash[strings.ToLower(item.Hash)] = item
+				if hash := core.NormalizeMagnetHash(item.Hash); hash != "" {
+					itemByHash[hash] = item
+				}
 			}
 		}
 	}
 
+	if recheckError != nil {
+		for hash, item := range partition.Reusable {
+			if _, rechecked := itemByHash[hash]; !rechecked {
+				partition.Found[hash] = item
+			}
+		}
+	}
 	data := &store.CheckMagnetData{
-		Items: []store.CheckMagnetDataItem{},
+		RecheckError: recheckError,
+		Items:        []store.CheckMagnetDataItem{},
 	}
 	tInfos := []buddy.TorrentInfoInput{}
 	for _, hash := range hashes {
-		if item, ok := foundItemByHash[hash]; ok {
+		if item, ok := partition.Found[hash]; ok {
 			data.Items = append(data.Items, item)
 			continue
 		}
@@ -391,7 +420,10 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 				item.Files = append(item.Files, mFile)
 			}
 		}
-		tInfos = append(tInfos, tInfo)
+		// A failed lookup supplies no new evidence to track.
+		if _, received := itemByHash[hash]; recheckError == nil || received {
+			tInfos = append(tInfos, tInfo)
+		}
 		data.Items = append(data.Items, item)
 	}
 	go buddy.BulkTrackMagnet(c, tInfos, nil, "", params.GetAPIKey(c.client.apiKey))
@@ -439,7 +471,7 @@ func (id CachedMagnetId) toString() string {
 }
 
 func (id CachedMagnetId) toHash() string {
-	return strings.TrimPrefix(string(id), CachedMagnetIdPrefix)
+	return core.NormalizeMagnetHash(strings.TrimPrefix(string(id), CachedMagnetIdPrefix))
 }
 
 func listFolderFlat(c *StoreClient, apiKey string, folderId string, result []store.MagnetFile, parent *store.MagnetFile) ([]store.MagnetFile, error) {
@@ -646,7 +678,7 @@ func (c *StoreClient) GetMagnet(params *store.GetMagnetParams) (*store.GetMagnet
 		if err != nil {
 			return nil, err
 		}
-		files, err := c.getCachedMagnetFiles(params.APIKey, magnet.Link, true)
+		files, err := c.getCachedMagnetFiles(params.APIKey, magnet.Link, true, stats.CallInfo{})
 		if err != nil {
 			return nil, err
 		}

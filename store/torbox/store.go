@@ -2,6 +2,7 @@ package torbox
 
 import (
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -9,6 +10,8 @@ import (
 	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/buddy"
 	"github.com/MunifTanjim/stremthru/internal/cache"
+	"github.com/MunifTanjim/stremthru/internal/config"
+	store_util "github.com/MunifTanjim/stremthru/internal/store/util"
 	"github.com/MunifTanjim/stremthru/internal/torrent_stream"
 	"github.com/MunifTanjim/stremthru/internal/util"
 	"github.com/MunifTanjim/stremthru/store"
@@ -126,14 +129,15 @@ func (c *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 		hashes[i] = magnet.Hash
 	}
 
-	foundItemByHash := map[string]store.CheckMagnetDataItem{}
-
+	var partition store_util.CheckMagnetItemsPartition
 	if data, err := buddy.CheckMagnet(c, hashes, params.GetAPIKey(c.client.apiKey), params.ClientIP, params.SId, false); err != nil {
 		return nil, err
 	} else {
-		for _, item := range data.Items {
-			foundItemByHash[item.Hash] = item
-		}
+		partition = store_util.PartitionCheckMagnetItems(store_util.PartitionCheckMagnetItemsParams{
+			Items:                   data.Items,
+			RecheckMissingFileLists: config.StoreRecheckMissingFileLists,
+			LocalOnly:               params.LocalOnly,
+		})
 	}
 
 	if params.LocalOnly {
@@ -142,7 +146,7 @@ func (c *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 		}
 
 		for _, hash := range hashes {
-			if item, ok := foundItemByHash[hash]; ok {
+			if item, ok := partition.Found[hash]; ok {
 				data.Items = append(data.Items, item)
 			}
 		}
@@ -150,7 +154,7 @@ func (c *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 	}
 
 	for _, hash := range hashes {
-		if _, ok := foundItemByHash[hash]; !ok {
+		if _, ok := partition.Found[hash]; !ok {
 			missingHashes = append(missingHashes, hash)
 		}
 	}
@@ -164,12 +168,24 @@ func (c *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 		ctcParams.APIKey = params.APIKey
 		start := time.Now()
 		res, err := c.client.CheckTorrentsCached(ctcParams)
-		stats.Record(c.Name, "check_torz", time.Since(start), err != nil)
+		info := stats.CheckCall(partition.FileListRecheckCount(missingHashes, params.FileListRecheckHashes), len(missingHashes))
+		stats.RecordWithInfo(c.Name, "check_torz", time.Since(start), err != nil, info)
 		if err != nil {
-			return nil, err
+			return partition.Restore(hashes, err)
 		}
 		for _, t := range res.Data {
-			tByHash[strings.ToLower(t.Hash)] = t
+			hash := core.NormalizeMagnetHash(t.Hash)
+			if hash == "" {
+				continue
+			}
+			if previous, found := tByHash[hash]; found {
+				// Duplicate provider entries must not overwrite blocked-file evidence.
+				previous.Files = append(previous.Files, t.Files...)
+				tByHash[hash] = previous
+			} else {
+				t.Files = slices.Clone(t.Files)
+				tByHash[hash] = t
+			}
 		}
 	}
 	data := &store.CheckMagnetData{
@@ -177,7 +193,7 @@ func (c *StoreClient) CheckMagnet(params *store.CheckMagnetParams) (*store.Check
 	}
 	tInfos := []buddy.TorrentInfoInput{}
 	for _, hash := range hashes {
-		if item, ok := foundItemByHash[hash]; ok {
+		if item, ok := partition.Found[hash]; ok {
 			data.Items = append(data.Items, item)
 			continue
 		}

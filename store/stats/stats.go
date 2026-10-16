@@ -18,7 +18,40 @@ const (
 	max_durations_per_bucket = 100_000
 )
 
+type CallKind uint8
+
+const (
+	CallNormal CallKind = iota
+	CallRecheckOnly
+	CallMixed
+)
+
+// CallInfo attributes an existing API call; it never creates a second call.
+type CallInfo struct {
+	Kind          CallKind
+	RecheckHashes int
+}
+
+func CheckCall(recheckHashes, totalHashes int) CallInfo {
+	if recheckHashes == 0 {
+		return CallInfo{}
+	}
+	kind := CallRecheckOnly
+	if recheckHashes < totalHashes {
+		kind = CallMixed
+	}
+	return CallInfo{Kind: kind, RecheckHashes: recheckHashes}
+}
+
+type RecheckStats struct {
+	OnlyCalls  int64 `json:"only_calls"`
+	MixedCalls int64 `json:"mixed_calls"`
+	Errors     int64 `json:"errors"`
+	Hashes     int64 `json:"hashes"`
+}
+
 type bucket struct {
+	rechecks        RecheckStats
 	timestamp       int64
 	count           int64
 	errorCount      int64
@@ -40,6 +73,7 @@ func (ms *MethodStats) getBucket(now time.Time) *bucket {
 	if b.timestamp != ts {
 		b.timestamp = ts
 		b.count = 0
+		b.rechecks = RecheckStats{}
 		b.errorCount = 0
 		b.totalDurationMs = 0
 		b.minDurationMs = 0
@@ -50,6 +84,10 @@ func (ms *MethodStats) getBucket(now time.Time) *bucket {
 }
 
 func (ms *MethodStats) Record(duration time.Duration, isError bool) {
+	ms.record(duration, isError, CallInfo{})
+}
+
+func (ms *MethodStats) record(duration time.Duration, isError bool, info CallInfo) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
@@ -59,6 +97,17 @@ func (ms *MethodStats) Record(duration time.Duration, isError bool) {
 	b.count++
 	if isError {
 		b.errorCount++
+	}
+	if info.Kind == CallRecheckOnly || info.Kind == CallMixed {
+		if info.Kind == CallMixed {
+			b.rechecks.MixedCalls++
+		} else {
+			b.rechecks.OnlyCalls++
+		}
+		if isError {
+			b.rechecks.Errors++
+		}
+		b.rechecks.Hashes += int64(info.RecheckHashes)
 	}
 	b.totalDurationMs += durationMs
 	if len(b.durations) < max_durations_per_bucket {
@@ -82,16 +131,17 @@ func (ms *MethodStats) Record(duration time.Duration, isError bool) {
 }
 
 type MethodStatsSnapshot struct {
-	TotalCount        int64   `json:"total_count"`
-	ErrorCount        int64   `json:"error_count"`
-	ErrorRate         float64 `json:"error_rate"`
-	AvgDurationMs     float64 `json:"avg_duration_ms"`
-	MinDurationMs     float64 `json:"min_duration_ms"`
-	MaxDurationMs     float64 `json:"max_duration_ms"`
-	P50DurationMs     float64 `json:"p50_duration_ms"`
-	P95DurationMs     float64 `json:"p95_duration_ms"`
-	P99DurationMs     float64 `json:"p99_duration_ms"`
-	RequestsPerMinute float64 `json:"requests_per_minute"`
+	Rechecks          RecheckStats `json:"rechecks"`
+	TotalCount        int64        `json:"total_count"`
+	ErrorCount        int64        `json:"error_count"`
+	ErrorRate         float64      `json:"error_rate"`
+	AvgDurationMs     float64      `json:"avg_duration_ms"`
+	MinDurationMs     float64      `json:"min_duration_ms"`
+	MaxDurationMs     float64      `json:"max_duration_ms"`
+	P50DurationMs     float64      `json:"p50_duration_ms"`
+	P95DurationMs     float64      `json:"p95_duration_ms"`
+	P99DurationMs     float64      `json:"p99_duration_ms"`
+	RequestsPerMinute float64      `json:"requests_per_minute"`
 }
 
 func (ms *MethodStats) Snapshot(window time.Duration) MethodStatsSnapshot {
@@ -116,6 +166,10 @@ func (ms *MethodStats) Snapshot(window time.Duration) MethodStatsSnapshot {
 			earliestTs = b.timestamp
 		}
 		snap.TotalCount += b.count
+		snap.Rechecks.OnlyCalls += b.rechecks.OnlyCalls
+		snap.Rechecks.MixedCalls += b.rechecks.MixedCalls
+		snap.Rechecks.Errors += b.rechecks.Errors
+		snap.Rechecks.Hashes += b.rechecks.Hashes
 		snap.ErrorCount += b.errorCount
 		totalDurationMs += b.totalDurationMs
 		if b.minDurationMs < snap.MinDurationMs {
@@ -175,6 +229,10 @@ type StoreStats struct {
 }
 
 func (ss *StoreStats) Record(method string, duration time.Duration, isError bool) {
+	ss.record(method, duration, isError, CallInfo{})
+}
+
+func (ss *StoreStats) record(method string, duration time.Duration, isError bool, info CallInfo) {
 	ss.mu.Lock()
 	ms, ok := ss.methods[method]
 	if !ok {
@@ -182,7 +240,7 @@ func (ss *StoreStats) Record(method string, duration time.Duration, isError bool
 		ss.methods[method] = ms
 	}
 	ss.mu.Unlock()
-	ms.Record(duration, isError)
+	ms.record(duration, isError, info)
 }
 
 func (ss *StoreStats) Snapshot(window time.Duration) map[string]MethodStatsSnapshot {
@@ -207,6 +265,12 @@ var (
 )
 
 func Record(storeName store.StoreName, method string, duration time.Duration, isError bool) {
+	RecordWithInfo(storeName, method, duration, isError, CallInfo{})
+}
+
+// RecordWithInfo replaces Record at an attributed call site, rather than adding
+// an event alongside it. Totals and recheck subsets share the same bucket lock.
+func RecordWithInfo(storeName store.StoreName, method string, duration time.Duration, isError bool, info CallInfo) {
 	globalMu.Lock()
 	ss, ok := globalStats[storeName]
 	if !ok {
@@ -214,7 +278,7 @@ func Record(storeName store.StoreName, method string, duration time.Duration, is
 		globalStats[storeName] = ss
 	}
 	globalMu.Unlock()
-	ss.Record(method, duration, isError)
+	ss.record(method, duration, isError, info)
 }
 
 type StoreStatsSnapshot struct {

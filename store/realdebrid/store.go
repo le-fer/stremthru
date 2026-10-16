@@ -12,7 +12,11 @@ import (
 	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/buddy"
 	"github.com/MunifTanjim/stremthru/internal/cache"
+	"github.com/MunifTanjim/stremthru/internal/config"
+	"github.com/MunifTanjim/stremthru/internal/logger"
 	"github.com/MunifTanjim/stremthru/internal/request"
+	"github.com/MunifTanjim/stremthru/internal/torrent_info"
+	"github.com/MunifTanjim/stremthru/internal/torrent_stream"
 	"github.com/MunifTanjim/stremthru/internal/util"
 	"github.com/MunifTanjim/stremthru/store"
 	"github.com/MunifTanjim/stremthru/store/stats"
@@ -50,6 +54,8 @@ func torrentStatusToMagnetStatus(status TorrentStatus) store.MagnetStatus {
 type LockedFileLink string
 
 const lockedFileLinkPrefix = "stremthru://store/realdebrid/"
+
+var log = logger.Scoped("store:realdebrid")
 
 func (l LockedFileLink) Create(torrentId string, link string) string {
 	return lockedFileLinkPrefix + util.Base64Encode(torrentId+":"+link)
@@ -127,6 +133,10 @@ func (c *StoreClient) getCacheKey(params request.Context, key string) string {
 }
 
 func (c *StoreClient) addIdHashMapCache(params request.Context, id, hash string) {
+	hash = core.NormalizeMagnetHash(hash)
+	if hash == "" {
+		return
+	}
 	c.idsByHashCacheMutex.Lock()
 	defer c.idsByHashCacheMutex.Unlock()
 
@@ -141,10 +151,14 @@ func (c *StoreClient) addIdHashMapCache(params request.Context, id, hash string)
 }
 
 func (c *StoreClient) removeIdHashMapCache(params request.Context, id, hash string) {
+	hash = core.NormalizeMagnetHash(hash)
 	c.idsByHashCacheMutex.Lock()
 	defer c.idsByHashCacheMutex.Unlock()
 
 	c.hashByIdCache.Remove(c.getCacheKey(params, id))
+	if hash == "" {
+		return
+	}
 	ids := map[string]bool{}
 	if c.idsByHashCache.Get(c.getCacheKey(params, hash), &ids) {
 		delete(ids, id)
@@ -181,9 +195,27 @@ func (c *StoreClient) GetUser(params *store.GetUserParams) (*store.User, error) 
 	return data, nil
 }
 
-func shouldRemoveTorrent(t *GetTorrentInfoData) bool {
+func shouldRemoveTorrent(t *GetTorrentInfoData, files torrentFileClassification) bool {
 	status := t.Status
-	return (status == TorrentStatusMagnetError || status == TorrentStatusError || status == TorrentStatusVirus || status == TorrentStatusDead) || ((status == TorrentStatusQueued || status == TorrentStatusDownloading || status == TorrentStatusDownloaded) && len(getSelectedFileIdsFromTorrent(t)) != len(getVideoFileIdsFromTorrent(t)))
+	return (status == TorrentStatusMagnetError || status == TorrentStatusError || status == TorrentStatusVirus || status == TorrentStatusDead) || ((status == TorrentStatusQueued || status == TorrentStatusDownloading || status == TorrentStatusDownloaded) && !sameFileIds(getSelectedFileIdsFromTorrent(t), files.videoFileIds))
+}
+
+func sameFileIds(actual, expected []string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+
+	remaining := make(map[string]struct{}, len(actual))
+	for _, id := range actual {
+		remaining[id] = struct{}{}
+	}
+	for _, id := range expected {
+		if _, ok := remaining[id]; !ok {
+			return false
+		}
+		delete(remaining, id)
+	}
+	return len(remaining) == 0
 }
 
 func (c *StoreClient) waitForTorrentStatus(ctx store.Ctx, t *GetTorrentInfoData, status TorrentStatus, maxRetry int, retryInterval time.Duration) (*GetTorrentInfoData, error) {
@@ -218,14 +250,37 @@ func getSelectedFileIdsFromTorrent(t *GetTorrentInfoData) []string {
 	return fileIds
 }
 
-func getVideoFileIdsFromTorrent(t *GetTorrentInfoData) []string {
-	fileIds := []string{}
-	for _, f := range t.Files {
-		if core.HasVideoExtension(f.Path) {
-			fileIds = append(fileIds, strconv.Itoa(f.Id))
+type torrentFileClassification struct {
+	videoFileIds  []string
+	hasDisallowed bool
+	fileCount     int
+}
+
+func classifyTorrentFiles(t *GetTorrentInfoData) torrentFileClassification {
+	result := torrentFileClassification{videoFileIds: []string{}, fileCount: len(t.Files)}
+	for _, file := range t.Files {
+		classification := core.ClassifyFile("", file.Path)
+		result.hasDisallowed = result.hasDisallowed || classification.Disallowed
+		if classification.AllowedVideo {
+			result.videoFileIds = append(result.videoFileIds, strconv.Itoa(file.Id))
 		}
 	}
-	return fileIds
+	return result
+}
+
+func (files torrentFileClassification) validationError(allowMixed bool) error {
+	message := ""
+	if files.hasDisallowed && (!allowMixed || len(files.videoFileIds) == 0) {
+		message = "torrent contains disallowed files"
+	} else if files.fileCount > 0 && len(files.videoFileIds) == 0 {
+		message = "torrent contains no allowed video files"
+	}
+	if message == "" {
+		return nil
+	}
+	err := core.NewStoreError(message)
+	err.StoreName = string(store.StoreNameRealDebrid)
+	return err
 }
 
 func (f *GetTorrentInfoDataFile) toStoreMagnetFile() store.MagnetFile {
@@ -234,6 +289,48 @@ func (f *GetTorrentInfoDataFile) toStoreMagnetFile() store.MagnetFile {
 		Path: f.Path,
 		Name: filepath.Base(f.Path),
 		Size: f.Bytes,
+	}
+}
+
+func (c *StoreClient) trackRejectedTorrent(params *store.AddMagnetParams, t *GetTorrentInfoData, hash string, private bool) {
+	if t.Status == TorrentStatusDownloaded {
+		files := make([]store.MagnetFile, len(t.Files))
+		for i := range t.Files {
+			files[i] = t.Files[i].toStoreMagnetFile()
+		}
+		buddy.TrackMagnet(c, hash, t.Filename, t.OriginalBytes, private, files, torrent_info.TorrentInfoCategoryUnknown, false, params.GetAPIKey(c.client.apiKey))
+		return
+	}
+
+	// Pre-download file evidence is useful locally, but does not establish cached status.
+	c.retainTorrentFileEvidence(t, hash, private)
+}
+
+func (c *StoreClient) retainTorrentFileEvidence(t *GetTorrentInfoData, hash string, private bool) {
+	storedFiles := make(torrent_stream.Files, len(t.Files))
+	for i := range t.Files {
+		file := t.Files[i].toStoreMagnetFile()
+		storedFiles[i] = torrent_stream.File{Idx: file.Idx, Path: file.Path, Name: file.Name, Size: file.Size}
+	}
+	if err := torrent_info.Upsert([]torrent_info.TorrentInfoInsertData{{
+		Hash: hash, TorrentTitle: t.Filename, Size: t.OriginalBytes,
+		Source: torrent_info.TorrentInfoSourceRealDebrid, Private: private, Files: storedFiles,
+	}}, torrent_info.TorrentInfoCategoryUnknown, false); err != nil {
+		log.Error("failed to retain torrent file evidence", "hash", hash, "error", core.PackError(err))
+	}
+}
+
+func (c *StoreClient) cleanupCreatedRejectedTorrent(ctx store.Ctx, id, hash string) {
+	if id == "" {
+		return
+	}
+	if _, err := c.RemoveMagnet(&store.RemoveMagnetParams{Ctx: ctx, Id: id}); err != nil {
+		log.Warn(
+			"failed to remove newly created rejected torrent",
+			"hash", hash,
+			"id", id,
+			"error", core.PackError(err),
+		)
 	}
 }
 
@@ -270,6 +367,7 @@ func (c *StoreClient) AddMagnet(params *store.AddMagnetParams) (*store.AddMagnet
 		c.idsByHashCache.Get(c.getCacheKey(params, magnet.Hash), &tIdsMap)
 	}
 	var t *GetTorrentInfoData
+	var createdTorrentID string
 	for tId := range tIdsMap {
 		tInfo, err := c.client.GetTorrentInfo(&GetTorrentInfoParams{
 			Ctx: params.Ctx,
@@ -279,7 +377,16 @@ func (c *StoreClient) AddMagnet(params *store.AddMagnetParams) (*store.AddMagnet
 			return nil, err
 		}
 		t = &tInfo.Data
-		if shouldRemoveTorrent(&tInfo.Data) {
+		files := classifyTorrentFiles(t)
+		if err := files.validationError(config.AllowVideoTorrentsWithDisallowedFiles); err != nil {
+			c.trackRejectedTorrent(params, t, magnet.Hash, isPrivate)
+			return nil, err
+		}
+		if shouldRemoveTorrent(t, files) {
+			if files.hasDisallowed {
+				// Retain unselected blocked companions without asserting cache status.
+				c.retainTorrentFileEvidence(t, magnet.Hash, isPrivate)
+			}
 			_, err := c.RemoveMagnet(&store.RemoveMagnetParams{
 				Ctx: params.Ctx,
 				Id:  t.Id,
@@ -318,6 +425,7 @@ func (c *StoreClient) AddMagnet(params *store.AddMagnetParams) (*store.AddMagnet
 			}
 			id = res.Data.Id
 		}
+		createdTorrentID = id
 		start := time.Now()
 		tInfo, err := c.client.GetTorrentInfo(&GetTorrentInfoParams{
 			Ctx: params.Ctx,
@@ -330,16 +438,31 @@ func (c *StoreClient) AddMagnet(params *store.AddMagnetParams) (*store.AddMagnet
 		t = &tInfo.Data
 	}
 
-	if t.Status != TorrentStatusQueued && t.Status != TorrentStatusDownloading && t.Status != TorrentStatusDownloaded {
+	shouldSelectFiles := t.Status != TorrentStatusQueued && t.Status != TorrentStatusDownloading && t.Status != TorrentStatusDownloaded
+	if shouldSelectFiles {
 		var err error
 		t, err = c.waitForTorrentStatus(params.Ctx, t, TorrentStatusWaitingFilesSelection, 5, 5*time.Second)
 		if err != nil {
 			return nil, err
 		}
-		_, err = c.client.StartTorrentDownload(&StartTorrentDownloadParams{
+	}
+
+	files := classifyTorrentFiles(t)
+	if err := files.validationError(config.AllowVideoTorrentsWithDisallowedFiles); err != nil {
+		c.trackRejectedTorrent(params, t, magnet.Hash, isPrivate)
+		c.cleanupCreatedRejectedTorrent(params.Ctx, createdTorrentID, magnet.Hash)
+		return nil, err
+	}
+	if files.hasDisallowed {
+		// Retain unselected blocked companions without asserting cache status.
+		c.retainTorrentFileEvidence(t, magnet.Hash, isPrivate)
+	}
+
+	if shouldSelectFiles {
+		_, err := c.client.StartTorrentDownload(&StartTorrentDownloadParams{
 			Ctx:     params.Ctx,
 			Id:      t.Id,
-			FileIds: getVideoFileIdsFromTorrent(t),
+			FileIds: files.videoFileIds,
 			IP:      params.ClientIP,
 		})
 		if err != nil {

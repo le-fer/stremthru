@@ -101,6 +101,7 @@ class StremThruStore {
         name?: string;
         status: StoreMagnetStatus;
       }>;
+      recheck_failed: boolean;
     }>("/v0/store/magnets/check", {
       method: "GET",
       params,
@@ -379,6 +380,7 @@ class StremThruStoreTorz {
         name?: string;
         status: StoreTorzStatus;
       }>;
+      recheck_failed: boolean;
     }>("/v0/store/torz/check", {
       method: "GET",
       params: queryParams,

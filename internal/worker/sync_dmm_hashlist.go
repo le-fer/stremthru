@@ -243,7 +243,7 @@ func InitSyncDMMHashlistWorker(conf *WorkerConfig) *Worker {
 				}
 				item := itemByHash[hash]
 				tInfos = append(tInfos, torrent_info.TorrentInfoInsertData{
-					Hash:         item.Hash,
+					Hash:         hash,
 					TorrentTitle: item.Filename,
 					Size:         item.Bytes,
 					Source:       torrent_info.TorrentInfoSourceDMM,

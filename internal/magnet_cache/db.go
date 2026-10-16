@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/cache"
 	"github.com/MunifTanjim/stremthru/internal/config"
 	"github.com/MunifTanjim/stremthru/internal/db"
@@ -63,7 +64,9 @@ func GetReadCacheStats() (hit int64, miss int64) {
 }
 
 func matchesSidFilter(mc *MagnetCache, sid string) bool {
-	if sid == "" || !mc.IsCached {
+	// Missing file metadata cannot establish a mismatch; keep it available for
+	// rechecking. Supplied file lists must still match the requested SID.
+	if sid == "" || !mc.IsCached || len(mc.Files) == 0 {
 		return true
 	}
 	for _, f := range mc.Files {
@@ -88,6 +91,7 @@ var query_get_by_hashes = fmt.Sprintf(
 )
 
 func GetByHashes(storeCode store.StoreCode, hashes []string, sid string) ([]MagnetCache, error) {
+	hashes = core.NormalizeMagnetHashes(hashes)
 	if len(hashes) == 0 {
 		return []MagnetCache{}, nil
 	}
@@ -186,6 +190,10 @@ func writeCacheKey(storeCode store.StoreCode, hash string) string {
 }
 
 func Touch(storeCode store.StoreCode, hash string, files torrent_stream.Files, isCached bool, skipFileTracking bool) {
+	hash = core.NormalizeMagnetHash(hash)
+	if hash == "" {
+		return
+	}
 	cacheKey := writeCacheKey(storeCode, hash)
 	var prevIsCached bool
 	if prevIsCachedCache.Get(cacheKey, &prevIsCached) && prevIsCached == isCached {
@@ -228,6 +236,9 @@ var query_bulk_touch_on_conflict = fmt.Sprintf(
 )
 
 func BulkTouch(storeCode store.StoreCode, filesByHash map[string]torrent_stream.Files, cached map[string]bool, skipFileTracking bool) {
+	filesByHash = normalizeFilesByHash(filesByHash)
+	cached = normalizeCachedByHash(cached)
+
 	var hit_query strings.Builder
 	hit_query.WriteString(query_bulk_touch_before_values)
 	hit_placeholder := "(?,?,true)"
@@ -240,10 +251,6 @@ func BulkTouch(storeCode store.StoreCode, filesByHash map[string]torrent_stream.
 
 	var hit_args []any
 	var miss_args []any
-
-	if cached == nil {
-		cached = map[string]bool{}
-	}
 
 	for hash, files := range filesByHash {
 		if len(files) > 0 {
@@ -315,4 +322,59 @@ func BulkTouch(storeCode store.StoreCode, filesByHash map[string]torrent_stream.
 			}
 		}
 	}
+}
+
+func normalizeFilesByHash(filesByHash map[string]torrent_stream.Files) map[string]torrent_stream.Files {
+	canonical := true
+	for hash := range filesByHash {
+		if hash == "" || core.NormalizeMagnetHash(hash) != hash {
+			canonical = false
+			break
+		}
+	}
+	if canonical {
+		return filesByHash
+	}
+
+	normalized := make(map[string]torrent_stream.Files, len(filesByHash))
+	for hash, files := range filesByHash {
+		hash = core.NormalizeMagnetHash(hash)
+		if hash == "" {
+			continue
+		}
+		if previous, found := normalized[hash]; found {
+			merged := make(torrent_stream.Files, 0, len(previous)+len(files))
+			merged = append(merged, previous...)
+			merged = append(merged, files...)
+			normalized[hash] = merged
+		} else {
+			// The file slice is immutable here; reuse it unless canonical keys collide.
+			normalized[hash] = files
+		}
+	}
+	return normalized
+}
+
+func normalizeCachedByHash(cached map[string]bool) map[string]bool {
+	canonical := true
+	for hash := range cached {
+		if hash == "" || core.NormalizeMagnetHash(hash) != hash {
+			canonical = false
+			break
+		}
+	}
+	if canonical {
+		if cached == nil {
+			return map[string]bool{}
+		}
+		return cached
+	}
+
+	normalized := make(map[string]bool, len(cached))
+	for hash, isCached := range cached {
+		if hash = core.NormalizeMagnetHash(hash); hash != "" {
+			normalized[hash] = normalized[hash] || isCached
+		}
+	}
+	return normalized
 }

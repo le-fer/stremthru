@@ -34,6 +34,8 @@ var streamTemplate = stremio_transformer.StreamTemplateDefault
 var torzLazyPull = config.Stremio.Torz.LazyPull
 
 type WrappedStream struct {
+	// FileListDeferred marks candidates awaiting a checked cached file list.
+	FileListDeferred bool
 	*stremio.Stream
 	R           *stremio_transformer.StreamExtractorResult
 	torrentLink string
@@ -85,16 +87,23 @@ type indexerSearchQuery struct {
 
 var torrentFetchPool = pond.NewPool(20)
 
-func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId string) ([]WrappedStream, []string, error) {
+type indexerStreamsResult struct {
+	Streams              []WrappedStream
+	InvalidByHash        map[string]struct{}
+	DisallowedByHash     map[string]struct{}
+	ValidatedVideoByHash map[string]struct{}
+}
+
+func getStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId string) (indexerStreamsResult, error) {
 	if len(ctx.Indexers) == 0 {
-		return []WrappedStream{}, []string{}, nil
+		return indexerStreamsResult{Streams: []WrappedStream{}}, nil
 	}
 
 	log := ctx.Log
 
 	nsid, err := torrent_stream.NormalizeStreamId(stremId)
 	if err != nil {
-		return nil, nil, err
+		return indexerStreamsResult{}, err
 	}
 
 	queryMeta := indexerSearchQueryMeta{titles: []string{}}
@@ -102,16 +111,16 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 		if aniEp := util.SafeParseInt(nsid.Episode, -1); aniEp != -1 {
 			tvdbMaps, err := anidb.GetTVDBEpisodeMaps(nsid.Id, false)
 			if err != nil {
-				return nil, nil, err
+				return indexerStreamsResult{}, err
 			}
 			if epMap := tvdbMaps.GetByAnidbEpisode(aniEp); epMap != nil {
 				ep := epMap.GetTMDBEpisode(aniEp)
 				titles, err := anidb.GetTitlesByIds([]string{nsid.Id})
 				if err != nil {
-					return nil, nil, err
+					return indexerStreamsResult{}, err
 				}
 				if len(titles) == 0 {
-					return nil, nil, errors.New("no titles found for anidb id: " + nsid.Id)
+					return indexerStreamsResult{}, errors.New("no titles found for anidb id: " + nsid.Id)
 				}
 				queryMeta.titles = make([]string, 0, len(titles))
 				queryMeta.season = epMap.TVDBSeason
@@ -133,10 +142,10 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 	} else {
 		it, err := imdb_title.Get(nsid.Id)
 		if err != nil {
-			return nil, nil, err
+			return indexerStreamsResult{}, err
 		}
 		if it == nil {
-			return nil, nil, errors.New("imdb title not found: " + nsid.Id)
+			return indexerStreamsResult{}, errors.New("imdb title not found: " + nsid.Id)
 		}
 		queryMeta.titles = append(queryMeta.titles, it.Title)
 		if it.OrigTitle != "" && it.OrigTitle != it.Title {
@@ -257,7 +266,7 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 	if reqCtx.Err() != nil {
 		log.Warn("indexer search timed out, returning partial results")
 	} else if len(results) == 0 && len(realErrs) > 0 {
-		return nil, nil, errors.Join(realErrs...)
+		return indexerStreamsResult{}, errors.Join(realErrs...)
 	}
 
 	seenSourceURL := util.NewSet[string]()
@@ -265,6 +274,7 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 	for _, items := range results {
 		for i := range items {
 			item := &items[i]
+			item.Hash = core.NormalizeMagnetHash(item.Hash)
 			if item.HasMissingData() && item.SourceLink != "" {
 				if seenSourceURL.Has(item.SourceLink) {
 					continue
@@ -289,12 +299,19 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 	}
 
 	hashSet := util.NewSet[string]()
+	disallowedHashes := util.NewSet[string]()
+	allowMixed := config.AllowVideoTorrentsWithDisallowedFiles
 	hashes := []string{}
 	for _, items := range results {
 		for i := range items {
 			item := &items[i]
 			if item.HasMissingData() {
 				continue
+			}
+			// With mixed torrents disabled, reject a blocked hash across all entries,
+			// regardless of their order.
+			if !allowMixed && torrent_stream.Files(item.Files).HasDisallowedFile() {
+				disallowedHashes.Add(item.Hash)
 			}
 			if !hashSet.Has(item.Hash) {
 				hashSet.Add(item.Hash)
@@ -305,22 +322,54 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 
 	tInfoByHash, err := torrent_info.GetByHashes(hashes)
 	if err != nil {
-		return nil, nil, err
+		return indexerStreamsResult{}, err
 	}
 
 	filesByHashes, err := torrent_stream.GetFilesByHashes(hashes)
 	if err != nil {
-		return nil, nil, err
+		return indexerStreamsResult{}, err
+	}
+
+	if !allowMixed {
+		for hash, files := range filesByHashes {
+			if files.HasDisallowedFile() {
+				disallowedHashes.Add(hash)
+			}
+		}
 	}
 
 	strn := util.NewStringNormalizer()
 	tInfosToUpsert := []torrent_info.TorrentItem{}
+	rejectedFileEvidence := []torrent_info.TorrentItem{}
 	wrappedStreams := []WrappedStream{}
+	invalidByHash := map[string]struct{}{}
+	validatedVideoByHash := map[string]struct{}{}
 	for i, items := range results {
 		is_exact := sQueries[i].is_exact
 		for i := range items {
 			item := &items[i]
 			if item.HasMissingData() {
+				continue
+			}
+
+			files := torrent_stream.Files(item.Files)
+			disallowed := disallowedHashes.Has(item.Hash)
+			hasAllowedVideo := len(files) > 0 && files.HasAllowedVideo()
+			invalid := disallowed || (len(files) > 0 && !hasAllowedVideo)
+			if hasAllowedVideo && !disallowed {
+				validatedVideoByHash[item.Hash] = struct{}{}
+			}
+			// Retain usable supplied evidence before excluding an invalid result.
+			if invalid && len(item.Files) > 0 {
+				evidence := torrent_info.TorrentItem{
+					Hash: item.Hash, TorrentTitle: item.Title, Size: item.Size,
+					Indexer: item.Indexer, Source: torrent_info.TorrentInfoSourceIndexer,
+					Seeders: item.Seeders, Leechers: item.Leechers, Private: item.Private, Files: item.Files,
+				}
+				rejectedFileEvidence = append(rejectedFileEvidence, evidence)
+			}
+			if invalid {
+				invalidByHash[item.Hash] = struct{}{}
 				continue
 			}
 
@@ -353,7 +402,7 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 					if idToMatch != "" {
 						for i := range files {
 							f := &files[i]
-							if f.IsVideo() {
+							if f.IsAllowedVideo() {
 								if f.SId == idToMatch || f.ASId == idToMatch {
 									file = f
 								}
@@ -372,13 +421,13 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 						fSize = file.Size
 					}
 					fVideoHash = file.VideoHash
-				} else if core.HasVideoExtension(tInfo.TorrentTitle) {
+				} else if core.IsAllowedVideoFile(tInfo.TorrentTitle, "") {
 					fName = tInfo.TorrentTitle
 				}
 
 				pttr, err := tInfo.ToParsedResult()
 				if err != nil {
-					return nil, nil, err
+					return indexerStreamsResult{}, err
 				}
 
 				if len(tInfo.TorrentTitle) < len(item.Title)/2 {
@@ -454,7 +503,7 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 
 			pttr, err := util.ParseTorrentTitle(tInfo.TorrentTitle)
 			if err != nil {
-				return nil, nil, err
+				return indexerStreamsResult{}, err
 			}
 
 			data := &stremio_transformer.StreamExtractorResult{
@@ -502,7 +551,7 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 					if idToMatch != "" {
 						for i := range files {
 							f := &files[i]
-							if f.IsVideo() {
+							if f.IsAllowedVideo() {
 								if f.SId == idToMatch || f.ASId == idToMatch {
 									file = f
 								}
@@ -519,7 +568,7 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 						wrappedStream.Stream.BehaviorHints.VideoSize = file.Size
 					}
 					wrappedStream.Stream.BehaviorHints.VideoHash = file.VideoHash
-				} else if core.HasVideoExtension(tInfo.TorrentTitle) {
+				} else if core.IsAllowedVideoFile(tInfo.TorrentTitle, "") {
 					data.File.Name = tInfo.TorrentTitle
 				}
 			}
@@ -527,12 +576,76 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 			wrappedStreams = append(wrappedStreams, wrappedStream)
 		}
 	}
+	if err := torrent_info.Upsert(rejectedFileEvidence, torrent_info.TorrentInfoCategoryUnknown, false); err != nil {
+		log.Warn("failed to retain rejected indexer file evidence", "error", err)
+	}
 	go torrent_info.Upsert(tInfosToUpsert, torrent_info.TorrentInfoCategoryUnknown, false)
 
-	return wrappedStreams, hashes, nil
+	// Only supplied, validated video evidence clears a non-video-only sibling.
+	// A sibling with no file list remains compatible but cannot clear rejection.
+	for hash := range validatedVideoByHash {
+		delete(invalidByHash, hash)
+	}
+	disallowedByHash := make(map[string]struct{}, disallowedHashes.Size())
+	for _, hash := range disallowedHashes.ToSlice() {
+		disallowedByHash[hash] = struct{}{}
+	}
+	return indexerStreamsResult{
+		Streams:              wrappedStreams,
+		InvalidByHash:        invalidByHash,
+		DisallowedByHash:     disallowedByHash,
+		ValidatedVideoByHash: validatedVideoByHash,
+	}, nil
+}
+
+// Only hashes with a surviving stream candidate need provider availability checks.
+func getCheckMagnetHashes(stored, indexed []WrappedStream, disallowed map[string]struct{}) []string {
+	hashes := make([]string, 0, len(stored)+len(indexed))
+	seen := make(map[string]struct{}, cap(hashes))
+	for _, streams := range [][]WrappedStream{stored, indexed} {
+		for _, stream := range streams {
+			hash := core.NormalizeMagnetHash(stream.R.Hash)
+			if hash == "" {
+				continue
+			}
+			if _, blocked := disallowed[hash]; blocked {
+				continue
+			}
+			if _, ok := seen[hash]; ok {
+				continue
+			}
+			seen[hash] = struct{}{}
+			hashes = append(hashes, hash)
+		}
+	}
+	return hashes
 }
 
 func GetStreamsForHashes(stremType, stremId string, hashes []string, nsid *torrent_stream.NormalizedStremId) ([]WrappedStream, error) {
+	return getStreamsForHashes(stremType, stremId, hashes, nsid, storedStreamFileOptions{})
+}
+
+// GetStreamCandidatesForHashes defers stored no-video rejection until a store
+// check. Callers must validate the candidates with the returned cached file lists.
+// A sole opaque video also remains deferred so persistence does not prevent its
+// checked-file reconstruction on later requests.
+func GetStreamCandidatesForHashes(stremType, stremId string, hashes []string, nsid *torrent_stream.NormalizedStremId) ([]WrappedStream, error) {
+	return getStreamsForHashes(stremType, stremId, hashes, nsid, storedStreamFileOptions{DeferMissingVideo: true})
+}
+
+// GetStreamsForHashesWithCheckedFiles preserves strict blocked-file and episode
+// checks. checkedFiles must contain lists selected and validated by
+// UserDataStores.CheckMagnet.
+func GetStreamsForHashesWithCheckedFiles(stremType, stremId string, hashes []string, nsid *torrent_stream.NormalizedStremId, checkedFiles map[string][]store.MagnetFile) ([]WrappedStream, error) {
+	return getStreamsForHashes(stremType, stremId, hashes, nsid, storedStreamFileOptions{CheckedFiles: checkedFiles})
+}
+
+type storedStreamFileOptions struct {
+	CheckedFiles      map[string][]store.MagnetFile
+	DeferMissingVideo bool
+}
+
+func getStreamsForHashes(stremType, stremId string, hashes []string, nsid *torrent_stream.NormalizedStremId, options storedStreamFileOptions) ([]WrappedStream, error) {
 	tInfoByHash, err := torrent_info.GetByHashes(hashes)
 	if err != nil {
 		return nil, err
@@ -551,7 +664,37 @@ func GetStreamsForHashes(stremType, stremId string, hashes []string, nsid *torre
 		}
 
 		var file *torrent_stream.File
-		if files, ok := filesByHashes[hash]; ok {
+		fileListDeferred := false
+		files := filesByHashes[hash]
+		if !config.AllowVideoTorrentsWithDisallowedFiles && files.HasDisallowedFile() {
+			log.Trace("skipping torrent: disallowed files", "hash", hash, "sid", stremId)
+			continue
+		}
+		// Deferred reconstruction uses the selected checked list for matching,
+		// even when storage already contains an allowed but opaque video.
+		// Retained strict blocked-file evidence was checked before replacement.
+		if checkedFiles := options.CheckedFiles[hash]; len(checkedFiles) > 0 {
+			files = make(torrent_stream.Files, 0, len(checkedFiles))
+			for _, f := range checkedFiles {
+				files = append(files, torrent_stream.File{Name: f.Name, Path: f.Path, Size: f.Size, Idx: f.Idx, Source: f.Source, VideoHash: f.VideoHash, MediaInfo: f.MediaInfo})
+			}
+			files.Normalize()
+			if !stremio_shared.StoredFilesAreViable(files, false, config.AllowVideoTorrentsWithDisallowedFiles) {
+				continue
+			}
+		} else if !files.HasAllowedVideo() {
+			if len(files) > 0 {
+				if !options.DeferMissingVideo {
+					log.Trace("skipping torrent: no video files", "hash", hash, "sid", stremId)
+					continue
+				}
+				fileListDeferred = true
+			} else if options.DeferMissingVideo {
+				fileListDeferred = true
+			}
+		}
+
+		if len(files) > 0 {
 			idToMatch := stremId
 			if nsid.IsAnime {
 				if nsid.Id == "" {
@@ -563,7 +706,7 @@ func GetStreamsForHashes(stremType, stremId string, hashes []string, nsid *torre
 			if idToMatch != "" {
 				for i := range files {
 					f := &files[i]
-					if f.IsVideo() {
+					if f.IsAllowedVideo() {
 						if f.SId == idToMatch || f.ASId == idToMatch {
 							file = f
 							break
@@ -571,13 +714,19 @@ func GetStreamsForHashes(stremType, stremId string, hashes []string, nsid *torre
 					}
 				}
 			}
-			if file == nil && !nsid.IsAnime && nsid.IsSeries() && nsid.Episode != "" {
+			if !fileListDeferred && file == nil && !nsid.IsAnime && nsid.IsSeries() && nsid.Episode != "" {
+				videoCount := 0
+				opaqueVideo := false
 				for i := range files {
 					f := &files[i]
-					if f.IsVideo() {
+					if f.IsAllowedVideo() {
+						videoCount++
 						data := stremio_shared.ParseSeasonEpisodeFromName(f.Name, false)
 						if data.Season != -1 && strconv.Itoa(data.Season) != nsid.Season {
 							continue
+						}
+						if data.Episode == -1 && (f.SId == "" || f.SId == "*") && f.ASId == "" {
+							opaqueVideo = true
 						}
 						if data.Episode == -1 || strconv.Itoa(data.Episode) != nsid.Episode {
 							continue
@@ -586,7 +735,15 @@ func GetStreamsForHashes(stremType, stremId string, hashes []string, nsid *torre
 						break
 					}
 				}
-				if file == nil {
+				// A newly checked sole video can validate a formerly fileless
+				// candidate without identifying an episode. Keep its index unknown
+				// and let playback perform existing matching/single-video fallback.
+				// Explicit mismatches and ambiguous bundles still fail matching.
+				opaqueCandidate := videoCount == 1 && opaqueVideo
+				if file == nil && opaqueCandidate && options.DeferMissingVideo {
+					fileListDeferred = true
+				}
+				if file == nil && !fileListDeferred && !(len(options.CheckedFiles[hash]) > 0 && opaqueCandidate) {
 					log.Trace("skipping torrent: no matching file found", "hash", tInfo.Hash, "sid", stremId)
 					continue
 				}
@@ -629,12 +786,13 @@ func GetStreamsForHashes(stremType, stremId string, hashes []string, nsid *torre
 			fVideoHash = file.VideoHash
 
 			stremio_transformer.ApplyMediaInfo(data, file.MediaInfo)
-		} else if core.HasVideoExtension(tInfo.TorrentTitle) {
+		} else if core.IsAllowedVideoFile(tInfo.TorrentTitle, "") {
 			data.File.Name = tInfo.TorrentTitle
 		}
 
 		wrappedStreams = append(wrappedStreams, WrappedStream{
-			R: data,
+			R:                data,
+			FileListDeferred: fileListDeferred,
 			Stream: &stremio.Stream{
 				Name:        data.Addon.Name,
 				Description: data.TTitle,
@@ -743,51 +901,44 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var wg sync.WaitGroup
-
-	var wrappedStreams []WrappedStream
-	var getStreamsError error
-	wg.Go(func() {
-		wrappedStreams, getStreamsError = GetStreamsForHashes(contentType, id, hashes, nsid)
-	})
-
-	var wrappedStreamsFromIndexers []WrappedStream
-	var hashesFromIndexers []string
+	// Keep the original lookup set: indexer upserts may finish before this lookup.
+	// Newly indexed hashes already have streams and must not be loaded a second time.
+	storedHashes := slices.Clone(hashes)
+	var storedStreamCandidates []WrappedStream
+	var getStoredStreamsError error
+	var indexerResult indexerStreamsResult
 	var getStreamsFromIndexersError error
+	timeoutCtx, cancel := context.WithTimeout(r.Context(), config.Stremio.Torz.IndexerMaxTimeout)
+	defer cancel()
+	var wg sync.WaitGroup
 	wg.Go(func() {
-		timeoutCtx, cancel := context.WithTimeout(r.Context(), config.Stremio.Torz.IndexerMaxTimeout)
-		defer cancel()
-		wrappedStreamsFromIndexers, hashesFromIndexers, getStreamsFromIndexersError = GetStreamsFromIndexers(timeoutCtx, ctx, contentType, id)
-		log.Debug("fetched streams from indexers", "count", len(wrappedStreamsFromIndexers))
+		storedStreamCandidates, getStoredStreamsError = GetStreamCandidatesForHashes(contentType, id, storedHashes, nsid)
 	})
-
+	wg.Go(func() {
+		indexerResult, getStreamsFromIndexersError = getStreamsFromIndexers(timeoutCtx, ctx, contentType, id)
+	})
 	wg.Wait()
-
-	if getStreamsError != nil {
-		SendError(w, r, getStreamsError)
+	if getStoredStreamsError != nil {
+		SendError(w, r, getStoredStreamsError)
 		return
 	}
+	log.Debug("fetched streams from indexers", "count", len(indexerResult.Streams))
 
 	if getStreamsFromIndexersError != nil {
 		log.Error("failed to get streams from indexers", "error", getStreamsFromIndexersError)
-	} else {
-		wrappedStreams = append(wrappedStreams, wrappedStreamsFromIndexers...)
-		for _, hash := range hashesFromIndexers {
-			if !hashSet.Has(hash) {
-				hashSet.Add(hash)
-				hashes = append(hashes, hash)
-			}
-		}
 	}
 
 	isP2P := ud.IsP2P()
 
 	var isCachedByHash map[string]string
+	var invalidByHash map[string]struct{}
+	var checkedFilesByHash map[string][]store.MagnetFile
 	var hasErrByStoreCode map[string]struct{}
 	var checkMagnetError error
-	if !isP2P && len(hashes) > 0 {
+	checkMagnetHashes := getCheckMagnetHashes(storedStreamCandidates, indexerResult.Streams, indexerResult.DisallowedByHash)
+	if !isP2P && len(checkMagnetHashes) > 0 {
 		cmRes := ud.CheckMagnet(&store.CheckMagnetParams{
-			Magnets:  hashes,
+			Magnets:  checkMagnetHashes,
 			ClientIP: ctx.ClientIP,
 			SId:      id,
 		}, ctx.Log)
@@ -795,6 +946,8 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 			checkMagnetError = errors.Join(cmRes.Err...)
 		} else {
 			isCachedByHash = cmRes.ByHash
+			invalidByHash = cmRes.InvalidByHash
+			checkedFilesByHash = cmRes.FilesByHash
 			hasErrByStoreCode = cmRes.HasErrByStoreCode
 		}
 	}
@@ -804,7 +957,56 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wrappedStreams = filterStreams(wrappedStreams, filter)
+	wrappedStreams := storedStreamCandidates
+	deferredHashes := []string{}
+	seenDeferredHashes := map[string]struct{}{}
+	for _, stream := range wrappedStreams {
+		if stream.FileListDeferred {
+			if _, seen := seenDeferredHashes[stream.R.Hash]; !seen {
+				deferredHashes = append(deferredHashes, stream.R.Hash)
+				seenDeferredHashes[stream.R.Hash] = struct{}{}
+			}
+		}
+	}
+	if len(deferredHashes) > 0 {
+		resolved, resolveErr := GetStreamsForHashesWithCheckedFiles(contentType, id, deferredHashes, nsid, checkedFilesByHash)
+		if resolveErr != nil {
+			SendError(w, r, resolveErr)
+			return
+		}
+		resolvedByHash := make(map[string]WrappedStream, len(resolved))
+		for _, stream := range resolved {
+			resolvedByHash[stream.R.Hash] = stream
+		}
+		kept := wrappedStreams[:0]
+		for _, stream := range wrappedStreams {
+			if !stream.FileListDeferred {
+				kept = append(kept, stream)
+			} else if fresh, ok := resolvedByHash[stream.R.Hash]; ok {
+				kept = append(kept, fresh)
+			}
+		}
+		wrappedStreams = kept
+	}
+	if getStreamsFromIndexersError == nil {
+		wrappedStreams = mergeIndexerStreams(wrappedStreams, indexerResult, checkedFilesByHash)
+	}
+	// Load evidence only for candidates that survived merging. The original hash
+	// set can be much larger and cannot affect the response once it has no stream.
+	viabilityHashes := getCheckMagnetHashes(wrappedStreams, nil, nil)
+	storedFiles, err := torrent_stream.GetFilesByHashes(viabilityHashes)
+	if err != nil {
+		SendError(w, r, err)
+		return
+	}
+	viableStreams := wrappedStreams[:0]
+	for _, stream := range wrappedStreams {
+		_, validatedByIndexer := indexerResult.ValidatedVideoByHash[stream.R.Hash]
+		if stremio_shared.StoredFilesAreViable(storedFiles[stream.R.Hash], validatedByIndexer || len(checkedFilesByHash[stream.R.Hash]) > 0, config.AllowVideoTorrentsWithDisallowedFiles) {
+			viableStreams = append(viableStreams, stream)
+		}
+	}
+	wrappedStreams = filterStreams(viableStreams, filter)
 
 	stremio_transformer.SortStreams(wrappedStreams, ud.Sort)
 
@@ -814,6 +1016,12 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	uncachedStreams := []stremio.Stream{}
 	for _, wStream := range wrappedStreams {
 		hash := wStream.R.Hash
+
+		if _, invalid := invalidByHash[hash]; invalid {
+			log.Trace("suppressing torrent with disallowed files or no allowed video files", "hash", hash, "sid", id)
+			continue
+		}
+
 		if isP2P {
 			if wStream.FileIndex == -1 || wStream.R.IsPrivate {
 				continue
@@ -918,4 +1126,22 @@ func filterStreams(streams []WrappedStream, filter *stremio_transformer.StreamFi
 		}
 	}
 	return result
+}
+
+// mergeIndexerStreams applies newly discovered rejection evidence to both sources.
+// Rejection evidence excludes matching hashes from both stored and indexed streams.
+func mergeIndexerStreams(stored []WrappedStream, indexed indexerStreamsResult, checkedFilesByHash map[string][]store.MagnetFile) []WrappedStream {
+	streams := make([]WrappedStream, 0, len(stored)+len(indexed.Streams))
+	for _, source := range [][]WrappedStream{stored, indexed.Streams} {
+		for _, stream := range source {
+			if _, invalid := indexed.InvalidByHash[stream.R.Hash]; invalid {
+				_, disallowed := indexed.DisallowedByHash[stream.R.Hash]
+				if disallowed || len(checkedFilesByHash[stream.R.Hash]) == 0 {
+					continue
+				}
+			}
+			streams = append(streams, stream)
+		}
+	}
+	return streams
 }

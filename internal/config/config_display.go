@@ -61,8 +61,12 @@ type ConfigDisplayUser struct {
 }
 
 type ConfigDisplayStores struct {
-	ClientUserAgent string               `json:"client_user_agent"`
-	Items           []ConfigDisplayStore `json:"items"`
+	ClientUserAgent                       string               `json:"client_user_agent"`
+	AllowVideoTorrentsWithDisallowedFiles bool                 `json:"allow_video_torrents_with_disallowed_files"`
+	RecheckMissingFileLists               bool                 `json:"recheck_missing_file_lists"`
+	RecheckMissingFileListsCrossStore     bool                 `json:"recheck_missing_file_lists_cross_store"`
+	DisallowedExtensions                  []string             `json:"disallowed_extensions"`
+	Items                                 []ConfigDisplayStore `json:"items"`
 }
 
 type ConfigDisplayStore struct {
@@ -248,6 +252,11 @@ func BuildConfigDisplay(storeNames []string) ConfigDisplay {
 	}
 
 	data.Stores.ClientUserAgent = StoreClientUserAgent
+	data.Stores.AllowVideoTorrentsWithDisallowedFiles = AllowVideoTorrentsWithDisallowedFiles
+	data.Stores.RecheckMissingFileLists = StoreRecheckMissingFileLists
+	data.Stores.RecheckMissingFileListsCrossStore = StoreRecheckMissingFileLists && StoreRecheckMissingFileListsCrossStore
+	data.Stores.DisallowedExtensions = util.FileExtDisallowed.ToSlice()
+	slices.Sort(data.Stores.DisallowedExtensions)
 	for _, storeName := range storeNames {
 		storeConfig := ""
 		if !IsPublicInstance && StoreContentProxy.IsEnabled(storeName) {

@@ -44,6 +44,9 @@ func handleStoreTorzCheck(w http.ResponseWriter, r *http.Request) {
 		})...)
 	}
 
+	for i := range hashes {
+		hashes[i] = core.NormalizeMagnetHash(hashes[i])
+	}
 	rCtx := server.GetReqCtx(r)
 	rCtx.ReqQuery.Set("hash", "..."+strconv.Itoa(len(hashes))+" items...")
 
@@ -82,6 +85,9 @@ func handleStoreTorzCheck(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		server.SendError(w, r, err)
 		return
+	}
+	if data.RecheckError != nil {
+		log.Warn("failed to recheck missing file lists; retaining reusable results", "error", data.RecheckError, "store.name", ctx.Store.GetName())
 	}
 	if data.Items == nil {
 		data.Items = []store.CheckMagnetDataItem{}

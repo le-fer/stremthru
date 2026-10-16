@@ -23,20 +23,15 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { summarizeStoreStats } from "@/lib/store-stats";
 
 export function StoreStatsCard() {
   const stats = useStoreStats();
+  const [rechecksOpen, setRechecksOpen] = useState(false);
 
-  const totalCalls =
-    stats.data?.stores.reduce(
-      (sum, s) => sum + s.methods.reduce((ms, m) => ms + m.total_count, 0),
-      0,
-    ) ?? 0;
-  const totalErrors =
-    stats.data?.stores.reduce(
-      (sum, s) => sum + s.methods.reduce((ms, m) => ms + m.error_count, 0),
-      0,
-    ) ?? 0;
+  const { rechecks, totalCalls, totalErrors } = summarizeStoreStats(
+    stats.data?.stores ?? [],
+  );
   const overallErrorRate =
     totalCalls > 0 ? ((totalErrors / totalCalls) * 100).toFixed(2) : "0";
 
@@ -87,6 +82,50 @@ export function StoreStatsCard() {
             No store activity recorded yet
           </p>
         )}
+        <Collapsible
+          className="mt-3 border-t pt-2"
+          onOpenChange={setRechecksOpen}
+          open={rechecksOpen}
+        >
+          <CollapsibleTrigger className="hover:bg-muted/50 flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm font-medium">
+            <ChevronRight
+              className={`h-4 w-4 shrink-0 transition-transform ${rechecksOpen ? "rotate-90" : ""}`}
+            />
+            <span>Missing-file-list checks</span>
+            <span className="text-muted-foreground ml-auto text-xs font-normal">
+              Included in total calls
+            </span>
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="space-y-3 px-3 pb-2 pt-3">
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                {[
+                  ["Recheck-only calls", rechecks.only_calls],
+                  ["Mixed calls", rechecks.mixed_calls],
+                  ["Recheck call errors", rechecks.errors],
+                  ["Recheck hash attempts", rechecks.hashes],
+                ].map(([label, value]) => (
+                  <div
+                    className="bg-muted/30 rounded-md border p-3"
+                    key={label}
+                  >
+                    <p className="text-muted-foreground text-xs">{label}</p>
+                    <p className="mt-1 text-lg font-semibold tabular-nums">
+                      {stats.isLoading ? "…" : value.toLocaleString()}
+                    </p>
+                  </div>
+                ))}
+              </div>
+              <p className="text-muted-foreground max-w-3xl text-xs leading-relaxed">
+                Direct provider calls on this instance only. Mixed calls also
+                contain ordinary lookups, so these figures do not measure net
+                additional traffic. Hash attempts count cache-check submissions,
+                not unique hashes; subsequent file fetches count as calls but
+                not again as hashes.
+              </p>
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
       </CardContent>
     </Card>
   );
@@ -95,6 +134,11 @@ export function StoreStatsCard() {
 function StoreSection({ store }: { store: StoreStatsEntry }) {
   const [open, setOpen] = useState(false);
   const { methods } = store;
+  const showRechecks = methods.some(
+    (method) =>
+      (method.rechecks?.only_calls ?? 0) + (method.rechecks?.mixed_calls ?? 0) >
+      0,
+  );
 
   return (
     <Collapsible onOpenChange={setOpen} open={open}>
@@ -116,6 +160,14 @@ function StoreSection({ store }: { store: StoreStatsEntry }) {
                 <TableHead>Method</TableHead>
                 <TableHead className="text-right">Calls</TableHead>
                 <TableHead className="text-right">Errors</TableHead>
+                {showRechecks && (
+                  <>
+                    <TableHead className="text-right">Recheck-only</TableHead>
+                    <TableHead className="text-right">Mixed</TableHead>
+                    <TableHead className="text-right">Recheck errors</TableHead>
+                    <TableHead className="text-right">Hash attempts</TableHead>
+                  </>
+                )}
                 <TableHead className="text-right">Error %</TableHead>
                 <TableHead className="text-right">Avg (ms)</TableHead>
                 <TableHead className="text-right">P50 (ms)</TableHead>
@@ -136,6 +188,22 @@ function StoreSection({ store }: { store: StoreStatsEntry }) {
                   <TableCell className="text-right">
                     {method.error_count.toLocaleString()}
                   </TableCell>
+                  {showRechecks && (
+                    <>
+                      <TableCell className="text-right">
+                        {(method.rechecks?.only_calls ?? 0).toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {(method.rechecks?.mixed_calls ?? 0).toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {(method.rechecks?.errors ?? 0).toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {(method.rechecks?.hashes ?? 0).toLocaleString()}
+                      </TableCell>
+                    </>
+                  )}
                   <TableCell className="text-right">
                     {method.error_rate.toFixed(2)}
                   </TableCell>

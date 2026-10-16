@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/buddy"
 	"github.com/MunifTanjim/stremthru/internal/cache"
 	"github.com/MunifTanjim/stremthru/internal/config"
@@ -17,6 +18,13 @@ import (
 
 type RecordTorrentsPayload struct {
 	Items []torrent_info.TorrentItem `json:"items"`
+}
+
+func recordTorrents(payload *RecordTorrentsPayload) error {
+	for i := range payload.Items {
+		payload.Items[i].Hash = core.NormalizeMagnetHash(payload.Items[i].Hash)
+	}
+	return torrent_info.Upsert(payload.Items, "", false)
 }
 
 func handleRecordTorrents(w http.ResponseWriter, r *http.Request) {
@@ -37,7 +45,7 @@ func handleRecordTorrents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go torrent_info.Upsert(payload.Items, "", false)
+	go recordTorrents(payload)
 	w.WriteHeader(204)
 }
 

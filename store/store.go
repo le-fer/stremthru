@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"mime/multipart"
 	"time"
@@ -211,6 +212,8 @@ type CheckMagnetParams struct {
 	SId              string
 	LocalOnly        bool
 	IsTrustedRequest bool
+	// In-process attribution for cross-store missing-file-list checks.
+	FileListRecheckHashes map[string]struct{} `json:"-"`
 }
 
 type CheckMagnetDataItem struct {
@@ -224,6 +227,37 @@ type CheckMagnetDataItem struct {
 
 type CheckMagnetData struct {
 	Items []CheckMagnetDataItem `json:"items"`
+	// RecheckError reports an additional file-list lookup failure without losing
+	// reusable cached answers. Only its presence crosses the store API boundary;
+	// provider error details remain local diagnostics.
+	RecheckError error `json:"-"`
+}
+
+var ErrCheckMagnetRecheckFailed = errors.New("missing-file-list recheck failed")
+
+type checkMagnetDataJSON struct {
+	Items         []CheckMagnetDataItem `json:"items"`
+	RecheckFailed bool                  `json:"recheck_failed"`
+}
+
+func (d CheckMagnetData) MarshalJSON() ([]byte, error) {
+	return json.Marshal(checkMagnetDataJSON{
+		Items:         d.Items,
+		RecheckFailed: d.RecheckError != nil,
+	})
+}
+
+func (d *CheckMagnetData) UnmarshalJSON(data []byte) error {
+	var wire checkMagnetDataJSON
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	d.Items = wire.Items
+	d.RecheckError = nil
+	if wire.RecheckFailed {
+		d.RecheckError = ErrCheckMagnetRecheckFailed
+	}
+	return nil
 }
 
 type AddMagnetData struct {

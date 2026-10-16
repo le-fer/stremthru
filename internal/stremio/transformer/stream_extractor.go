@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/MunifTanjim/go-ptt"
+	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/util"
 	"github.com/MunifTanjim/stremthru/store"
 	"github.com/MunifTanjim/stremthru/stremio"
@@ -732,6 +733,7 @@ func (se StreamExtractor) Parse(stream *stremio.Stream, sType string) *StreamExt
 		r.Store.Name = string(store.StoreCode(strings.ToLower(r.Store.Code)).Name())
 	}
 
+	r.Hash = core.NormalizeMagnetHash(r.Hash)
 	r.Result = r.Normalize()
 
 	if r.Episode == -1 && len(r.Episodes) > 0 {

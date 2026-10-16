@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/util"
 	"github.com/MunifTanjim/stremthru/stremio"
 )
@@ -71,6 +72,7 @@ func ExtractCreateDataFromStream(hostname string, sid string, stream *stremio.St
 		data.Source = TorrentInfoSourceTorrentio
 		data = extractInputFromTorrentioStream(data, sid, stream)
 	}
+	data.Hash = core.NormalizeMagnetHash(data.Hash)
 	if data.Hash == "" {
 		return nil
 	}

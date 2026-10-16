@@ -465,13 +465,46 @@ function StoresSection({ stores }: { stores: ConfigData["stores"] }) {
     <CollapsibleConfigSection
       gradient="from-teal-500 to-emerald-500"
       icon="S"
-      settingsCount={1 + stores.items.length}
+      settingsCount={5 + stores.items.length}
       title="Stores"
     >
       <ConfigEntry
         className="mb-4"
         label="Store Client User Agent"
         value={stores.client_user_agent}
+      />
+
+      <ConfigEntry
+        label="Allow Video Torrents With Disallowed Files"
+        value={
+          stores.allow_video_torrents_with_disallowed_files
+            ? "enabled"
+            : "disabled"
+        }
+      />
+      <ConfigEntry
+        label="Recheck Missing File Lists"
+        value={stores.recheck_missing_file_lists ? "enabled" : "disabled"}
+      />
+      <ConfigEntry
+        label="Recheck Missing File Lists Across Stores"
+        value={
+          stores.recheck_missing_file_lists_cross_store ? "enabled" : "disabled"
+        }
+      />
+      <ConfigEntry
+        className="mb-4"
+        label="Disallowed Torrent File Extensions"
+        value={
+          <div className="flex flex-wrap gap-1">
+            {stores.disallowed_extensions.map((ext) => (
+              <Badge key={ext} variant="secondary">
+                {ext}
+              </Badge>
+            ))}
+            {stores.disallowed_extensions.length === 0 && "None"}
+          </div>
+        }
       />
 
       <div className="flex flex-col gap-2">

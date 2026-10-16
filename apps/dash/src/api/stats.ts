@@ -64,6 +64,13 @@ type TorznabIndexerSyncStats = {
 
 const HOUR = 60 * 60 * 1000;
 
+export type StoreRecheckStats = {
+  errors: number;
+  hashes: number;
+  mixed_calls: number;
+  only_calls: number;
+};
+
 export type StoreStatsEntry = {
   methods: StoreMethodStats[];
   name: string;
@@ -79,6 +86,7 @@ type StoreMethodStats = {
   p50_duration_ms: number;
   p95_duration_ms: number;
   p99_duration_ms: number;
+  rechecks?: StoreRecheckStats;
   requests_per_minute: number;
   total_count: number;
 };

@@ -214,6 +214,7 @@ class CheckMagnetDataItem(TypedDict):
 
 class CheckMagnetData(TypedDict):
     items: list[CheckMagnetDataItem]
+    recheck_failed: bool
 
 
 class GenerateLinkData(TypedDict):
@@ -358,6 +359,7 @@ class CheckTorzDataItem(TypedDict):
 
 class CheckTorzData(TypedDict):
     items: list[CheckTorzDataItem]
+    recheck_failed: bool
 
 
 class GetTorzDataFile(TypedDict):
