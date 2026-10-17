@@ -533,12 +533,12 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 }
 
 func GetStreamsForHashes(stremType, stremId string, hashes []string, nsid *torrent_stream.NormalizedStremId) ([]WrappedStream, error) {
-	tInfoByHash, err := torrent_info.GetByHashes(hashes)
+	tInfoByHash, err := torrent_info.GetByHashesFromPrimary(hashes)
 	if err != nil {
 		return nil, err
 	}
 
-	filesByHashes, err := torrent_stream.GetFilesByHashes(hashes)
+	filesByHashes, err := torrent_stream.GetFilesByHashesFromPrimary(hashes)
 	if err != nil {
 		return nil, err
 	}
@@ -596,6 +596,14 @@ func GetStreamsForHashes(stremType, stremId string, hashes []string, nsid *torre
 		pttr, err := tInfo.ToParsedResult()
 		if err != nil {
 			return nil, err
+		}
+		if file == nil && !nsid.IsAnime && nsid.IsSeries() {
+			if len(pttr.Seasons) > 0 && !slices.Contains(pttr.Seasons, util.SafeParseInt(nsid.Season, -1)) {
+				continue
+			}
+			if nsid.Episode != "" && len(pttr.Episodes) > 0 && !slices.Contains(pttr.Episodes, util.SafeParseInt(nsid.Episode, -1)) {
+				continue
+			}
 		}
 		data := &stremio_transformer.StreamExtractorResult{
 			Hash:      tInfo.Hash,
@@ -710,7 +718,11 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 			go buddy.PullTorrentsByStremId(cleanSId, "")
 		} else {
 			hashes := buddy.PullTorrentsByStremId(cleanSId, "")
-			pulledHashes = append(pulledHashes, hashes...)
+			// IMDb imports are ready for the same durable lookup used on repeat
+			// requests. Keep anime's existing numbering/mapping behavior.
+			if nsid.IsAnime {
+				pulledHashes = append(pulledHashes, hashes...)
+			}
 		}
 
 		torznab_indexer_syncinfo.QueueJob(nsid.String())
@@ -723,7 +735,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hashes, err := torrent_info.ListHashesByStremId(id)
+	hashes, err := torrent_info.ListHashesByStremIdFromPrimary(id)
 	if err != nil {
 		SendError(w, r, err)
 		return

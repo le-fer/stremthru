@@ -1,6 +1,11 @@
 package buddy
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/url"
 	"time"
 
 	"github.com/MunifTanjim/stremthru/core"
@@ -32,8 +37,18 @@ var noTorrentInfo = !config.Feature.HasTorz()
 
 // supports imdb or anidb
 func PullTorrentsByStremId(sid string, originInstanceId string) []string {
-	if noTorrentInfo || PullPeer == nil || PullPeer.IsHaltedCheckMagnet() || !tss.ShouldPull(sid) {
-		return nil
+	hashes, _ := pullTorrentsByStremId(sid, originInstanceId)
+	return hashes
+}
+
+// Peer exports must distinguish a failed import from a successful empty pull.
+// Other callers retain the best-effort pull API above.
+func pullTorrentsByStremId(sid string, originInstanceId string) ([]string, error) {
+	if noTorrentInfo || PullPeer == nil || !tss.ShouldPull(sid) {
+		return nil, nil
+	}
+	if PullPeer.IsHaltedCheckMagnet() {
+		return nil, core.NewUpstreamError("peer torrent pull temporarily halted")
 	}
 
 	cleanSId := ts.CleanStremId(sid)
@@ -43,19 +58,43 @@ func PullTorrentsByStremId(sid string, originInstanceId string) []string {
 		LocalOnly:        pullLocalOnly,
 		OriginInstanceId: originInstanceId,
 	})
-	duration := time.Since(start)
+	fetchDuration := time.Since(start)
 
 	if err != nil {
-		if duration > 25*time.Second {
+		if fetchDuration > 25*time.Second {
 			PullPeer.HaltCheckMagnet()
 		}
 
-		pullPeerLog.Error("failed to pull torrents", "error", core.PackError(err), "duration", duration, "sid", cleanSId)
-		return nil
+		// Transport errors and peer response bodies can contain private URLs or
+		// credentials. Keep their text and causes out of logs and public errors.
+		var netErr net.Error
+		timeout := errors.As(err, &netErr) && netErr.Timeout()
+		statusCode := res.StatusCode
+		var transportErr *url.Error
+		if errors.As(err, &transportErr) {
+			// The API response wrapper substitutes 503 when no HTTP response exists.
+			statusCode = 0
+		}
+		category := "transport"
+		var dnsErr *net.DNSError
+		switch {
+		case timeout:
+			category = "timeout"
+		case errors.Is(err, context.Canceled):
+			category = "canceled"
+		case errors.As(err, &dnsErr):
+			category = "dns"
+		case statusCode >= 400:
+			category = "http"
+		case statusCode != 0:
+			category = "response"
+		}
+		pullPeerLog.Error("failed to pull torrents", "error_type", fmt.Sprintf("%T", err), "error_category", category, "status_code", statusCode, "timeout", timeout, "fetch_duration", fetchDuration, "duration", time.Since(start), "sid", cleanSId)
+		return nil, core.NewUpstreamError("failed to pull peer torrents")
 	}
 
 	count := len(res.Data.Items)
-	pullPeerLog.Info("pulled torrents", "duration", duration, "sid", cleanSId, "count", count)
+	importStart := time.Now()
 
 	hashes := make([]string, count)
 	items := make([]ti.TorrentInfoInsertData, count)
@@ -75,9 +114,14 @@ func PullTorrentsByStremId(sid string, originInstanceId string) []string {
 			Private:      data.Private,
 		}
 	}
-	ti.Upsert(items, "", false)
-	go tss.MarkPulled(cleanSId)
-	return hashes
+	if err := ti.UpsertFromPeer(items, cleanSId); err != nil {
+		pullPeerLog.Error("failed to import pulled torrents", "error", core.PackError(err), "fetch_duration", fetchDuration, "import_duration", time.Since(importStart), "duration", time.Since(start), "sid", cleanSId)
+		return nil, err
+	}
+	importDuration := time.Since(importStart)
+	tss.MarkPulled(cleanSId)
+	pullPeerLog.Info("pulled torrents", "fetch_duration", fetchDuration, "import_duration", importDuration, "duration", time.Since(start), "sid", cleanSId, "count", count)
+	return hashes, nil
 }
 
 func ListTorrentsByStremId(sid string, localOnly bool, originInstanceId string, noMissingSize bool) (*ti.ListTorrentsData, error) {
@@ -87,10 +131,14 @@ func ListTorrentsByStremId(sid string, localOnly bool, originInstanceId string, 
 	}
 
 	if !localOnly {
-		PullTorrentsByStremId(sid, originInstanceId)
+		if _, err := pullTorrentsByStremId(sid, originInstanceId); err != nil {
+			return nil, err
+		}
 	}
 
-	data, err := ti.ListByStremId(sid, noMissingSize)
+	// Export committed imports even while replicas lag, including requests
+	// served from the pull cooldown or restricted to local data.
+	data, err := ti.ListByStremIdFromPrimary(sid, noMissingSize)
 	if err != nil {
 		return nil, err
 	}

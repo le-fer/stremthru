@@ -20,5 +20,5 @@ func TestRecordQuery(t *testing.T) {
 		"uat = unixepoch() " +
 		"WHERE (ts.src NOT IN ('dht','tor') AND EXCLUDED.i != -1 AND ts.i != EXCLUDED.i) OR (ts.src NOT IN ('dht','tor') AND EXCLUDED.s != -1 AND ts.s != EXCLUDED.s) OR (EXCLUDED.sid NOT IN ('', '*') AND ts.sid != EXCLUDED.sid) OR (EXCLUDED.asid != '' AND ts.asid != EXCLUDED.asid) OR (EXCLUDED.vhash != '' AND ts.vhash = '') OR (EXCLUDED.mi IS NOT NULL AND (ts.mi IS NULL OR (ts.mi->>'src' IS NOT NULL AND EXCLUDED.mi->>'src' IS NULL))) OR ((EXCLUDED.src IN ('dht','tor') OR ts.src NOT IN ('dht','tor')) AND (EXCLUDED.src != 'mfn' OR ts.src = 'mfn') AND EXCLUDED.src != '')"
 
-	assert.Equal(t, expected_query, get_record_query(1))
+	assert.Equal(t, expected_query, get_record_query(1, false))
 }

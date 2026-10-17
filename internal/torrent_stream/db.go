@@ -19,6 +19,7 @@ import (
 	"github.com/MunifTanjim/stremthru/internal/anime"
 	"github.com/MunifTanjim/stremthru/internal/cache"
 	"github.com/MunifTanjim/stremthru/internal/db"
+	"github.com/MunifTanjim/stremthru/internal/imdb_torrent"
 	"github.com/MunifTanjim/stremthru/internal/torrent_stream/media_info"
 	"github.com/MunifTanjim/stremthru/internal/util"
 	"github.com/MunifTanjim/stremthru/store"
@@ -216,6 +217,18 @@ var query_cleanup_files_with_name_as_path = fmt.Sprintf(
 )
 
 func cleanupFilesWithNameAsPath(hash string, files Files) {
+	err := imdb_torrent.WithHashLocks([]string{hash}, func(executor db.Executor) error {
+		return cleanupFilesWithNameAsPathLocked(executor, hash, files)
+	})
+	if err != nil {
+		log.Error("failed to cleanup files with name as path", "error", err, "hash", hash)
+	} else {
+		log.Debug("cleaned up files with name as path", "hash", hash)
+		filesByHashCache.Remove(hash)
+	}
+}
+
+func cleanupFilesWithNameAsPathLocked(executor db.Executor, hash string, files Files) error {
 	for i := range files {
 		f := &files[i]
 		if strings.HasPrefix(f.Path, "/") || f.Path == "" {
@@ -223,7 +236,7 @@ func cleanupFilesWithNameAsPath(hash string, files Files) {
 		}
 
 		if f.SId != "" && f.SId != "*" {
-			if _, err := db.Exec(
+			if _, err := executor.Exec(
 				fmt.Sprintf(
 					`UPDATE %s SET %s = ? WHERE %s = ? AND %s LIKE '%%/%s' AND %s IN ('','*')`,
 					TableName,
@@ -237,12 +250,12 @@ func cleanupFilesWithNameAsPath(hash string, files Files) {
 				hash,
 			); err != nil {
 				log.Error("failed to cleanup files with name as path (migrate sid)", "error", err, "hash", hash, "fpath", f.Path, "sid", f.SId)
-				return
+				return err
 			}
 		}
 
 		if f.ASId != "" {
-			if _, err := db.Exec(
+			if _, err := executor.Exec(
 				fmt.Sprintf(
 					`UPDATE %s SET %s = ? WHERE %s = ? AND %s LIKE '%%/%s' AND %s = ''`,
 					TableName,
@@ -256,17 +269,12 @@ func cleanupFilesWithNameAsPath(hash string, files Files) {
 				hash,
 			); err != nil {
 				log.Error("failed to cleanup files with name as path (migrate asid)", "error", err, "hash", hash, "fpath", f.Path, "asid", f.ASId)
-				return
+				return err
 			}
 		}
 	}
-	_, err := db.Exec(query_cleanup_files_with_name_as_path, hash)
-	if err != nil {
-		log.Error("failed to cleanup files with name as path", "error", err, "hash", hash)
-	} else {
-		log.Debug("cleaned up files with name as path", "hash", hash)
-		filesByHashCache.Remove(hash)
-	}
+	_, err := executor.Exec(query_cleanup_files_with_name_as_path, hash)
+	return err
 }
 
 var query_get_anime_file_for_kitsu = fmt.Sprintf(
@@ -360,6 +368,15 @@ func GetReadCacheStats() (hit int64, miss int64) {
 }
 
 func GetFilesByHashes(hashes []string) (map[string]Files, error) {
+	return getFilesByHashes(hashes, db.GetDB(), true)
+}
+
+// Primary reads bypass the shared file cache for read-after-write consistency.
+func GetFilesByHashesFromPrimary(hashes []string) (map[string]Files, error) {
+	return getFilesByHashes(hashes, db.GetPrimary(), false)
+}
+
+func getFilesByHashes(hashes []string, executor db.Executor, useCache bool) (map[string]Files, error) {
 	byHash := map[string]Files{}
 
 	if len(hashes) == 0 {
@@ -369,7 +386,7 @@ func GetFilesByHashes(hashes []string) (map[string]Files, error) {
 	var missedHashes []string
 	for _, hash := range hashes {
 		var cached Files
-		if filesByHashCache.Get(hash, &cached) {
+		if useCache && filesByHashCache.Get(hash, &cached) {
 			readCacheHitCount.Add(1)
 			byHash[hash] = cached
 		} else {
@@ -381,11 +398,13 @@ func GetFilesByHashes(hashes []string) (map[string]Files, error) {
 		return byHash, nil
 	}
 
-	readCacheMissCount.Add(int64(len(missedHashes)))
+	if useCache {
+		readCacheMissCount.Add(int64(len(missedHashes)))
+	}
 
 	query_in_hashes, args := db.InStringValues(missedHashes)
 
-	rows, err := db.Query("SELECT h, "+db.FnJSONGroupArray+"("+db.FnJSONObject+"('i', i, 'p', p, 's', s, 'sid', sid, 'asid', asid, 'src', src, 'vhash', vhash, 'mi', jsonb(mi))) AS files FROM "+TableName+" WHERE h "+query_in_hashes+" GROUP BY h", args...)
+	rows, err := executor.Query("SELECT h, "+db.FnJSONGroupArray+"("+db.FnJSONObject+"('i', i, 'p', p, 's', s, 'sid', sid, 'asid', asid, 'src', src, 'vhash', vhash, 'mi', jsonb(mi))) AS files FROM "+TableName+" WHERE h "+query_in_hashes+" GROUP BY h", args...)
 	if err != nil {
 		return nil, err
 	}
@@ -397,7 +416,9 @@ func GetFilesByHashes(hashes []string) (map[string]Files, error) {
 		if err := rows.Scan(&hash, &files); err != nil {
 			return nil, err
 		}
-		filesByHashCache.Add(hash, files)
+		if useCache {
+			filesByHashCache.Add(hash, files)
+		}
 		byHash[hash] = files
 	}
 
@@ -498,33 +519,45 @@ var query_record_on_conflict_set_cond = func(col, cond string) string {
 	)
 }
 
-var record_streams_query_on_conflict = fmt.Sprintf(
-	" ON CONFLICT (%s,%s) DO UPDATE SET %s, %s, %s, %s, %s, %s, %s, %s WHERE %s",
-	Column.Hash,
-	Column.Path,
-	query_record_on_conflict_set_cond(Column.Idx, query_record_cond_should_update_idx),
-	query_record_on_conflict_set_cond(Column.Size, query_record_cond_should_update_size),
-	query_record_on_conflict_set_cond(Column.SId, query_record_cond_should_update_sid),
-	query_record_on_conflict_set_cond(Column.ASId, query_record_cond_should_update_asid),
-	query_record_on_conflict_set_cond(Column.VideoHash, query_record_cond_should_update_vhash),
-	query_record_on_conflict_set_cond(Column.MediaInfo, query_record_cond_should_update_mi),
-	query_record_on_conflict_set_cond(Column.Source, query_record_cond_should_update_src),
-	fmt.Sprintf("%s = %s", Column.UAt, db.CurrentTimestamp),
-	strings.Join([]string{
-		query_record_cond_should_update_idx,
-		query_record_cond_should_update_size,
-		query_record_cond_should_update_sid,
-		query_record_cond_should_update_asid,
-		query_record_cond_should_update_vhash,
-		query_record_cond_should_update_mi,
-		query_record_cond_should_update_src,
-	}, " OR "),
+func recordStreamsQueryOnConflict(sidCondition, asidCondition string) string {
+	return fmt.Sprintf(
+		" ON CONFLICT (%s,%s) DO UPDATE SET %s, %s, %s, %s, %s, %s, %s, %s WHERE %s",
+		Column.Hash,
+		Column.Path,
+		query_record_on_conflict_set_cond(Column.Idx, query_record_cond_should_update_idx),
+		query_record_on_conflict_set_cond(Column.Size, query_record_cond_should_update_size),
+		query_record_on_conflict_set_cond(Column.SId, sidCondition),
+		query_record_on_conflict_set_cond(Column.ASId, asidCondition),
+		query_record_on_conflict_set_cond(Column.VideoHash, query_record_cond_should_update_vhash),
+		query_record_on_conflict_set_cond(Column.MediaInfo, query_record_cond_should_update_mi),
+		query_record_on_conflict_set_cond(Column.Source, query_record_cond_should_update_src),
+		fmt.Sprintf("%s = %s", Column.UAt, db.CurrentTimestamp),
+		strings.Join([]string{
+			query_record_cond_should_update_idx,
+			query_record_cond_should_update_size,
+			sidCondition,
+			asidCondition,
+			query_record_cond_should_update_vhash,
+			query_record_cond_should_update_mi,
+			query_record_cond_should_update_src,
+		}, " OR "),
+	)
+}
+
+var record_streams_query_on_conflict = recordStreamsQueryOnConflict(query_record_cond_should_update_sid, query_record_cond_should_update_asid)
+var record_peer_streams_query_on_conflict = recordStreamsQueryOnConflict(
+	"(ts.sid IN ('', '*') AND "+query_record_cond_should_update_sid+")",
+	"(ts.asid = '' AND "+query_record_cond_should_update_asid+")",
 )
 
-func get_record_query(count int) string {
+func get_record_query(count int, fromPeer bool) string {
+	conflict := record_streams_query_on_conflict
+	if fromPeer {
+		conflict = record_peer_streams_query_on_conflict
+	}
 	return record_streams_query_before_values +
 		util.RepeatJoin(record_streams_query_values_placeholder, count, ",") +
-		record_streams_query_on_conflict
+		conflict
 }
 
 type prevRecordData struct {
@@ -545,7 +578,16 @@ func GetWriteCacheStats() (hit int64, miss int64) {
 	return writeCacheHitCount.Load(), writeCacheMissCount.Load()
 }
 
+// RecordFromPeer fills missing IDs but keeps existing explicit file mappings.
+func RecordFromPeer(items []InsertData, discardIdx bool) error {
+	return record(items, discardIdx, true)
+}
+
 func Record(items []InsertData, discardIdx bool) error {
+	return record(items, discardIdx, false)
+}
+
+func record(items []InsertData, discardIdx, fromPeer bool) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -583,7 +625,7 @@ func Record(items []InsertData, discardIdx bool) error {
 				fpBuf.WriteString(strconv.FormatBool(item.MediaInfo != nil))
 				fingerprint := xxh3.Hash(fpBuf.Bytes())
 				var prev prevRecordData
-				if prevRecordCache.Get(key, &prev) && (prev.Source == item.Source || prev.Source == "dht" || prev.Source == "tor" || prev.Fingerprint == fingerprint) {
+				if !fromPeer && prevRecordCache.Get(key, &prev) && (prev.Source == item.Source || prev.Source == "dht" || prev.Source == "tor" || prev.Fingerprint == fingerprint) {
 					writeCacheHitCount.Add(1)
 					count--
 					continue
@@ -609,7 +651,16 @@ func Record(items []InsertData, discardIdx bool) error {
 		if count == 0 {
 			continue
 		}
-		_, err := db.Exec(get_record_query(count), args...)
+		query := get_record_query(count, fromPeer)
+		hashes := make([]string, 0, len(recordDataByKey))
+		for key := range recordDataByKey {
+			hash, _, _ := strings.Cut(key, ":")
+			hashes = append(hashes, hash)
+		}
+		err := imdb_torrent.WithHashLocks(hashes, func(executor db.Executor) error {
+			_, err := executor.Exec(query, args...)
+			return err
+		})
 		if err != nil {
 			log.Error("failed partially to record", "error", err)
 			errs = append(errs, err)
@@ -617,7 +668,9 @@ func Record(items []InsertData, discardIdx bool) error {
 			log.Debug("recorded torrent stream", "count", count)
 			invalidatedHashes := util.NewSet[string]()
 			for key, data := range recordDataByKey {
-				prevRecordCache.Add(key, data)
+				if !fromPeer {
+					prevRecordCache.Add(key, data)
+				}
 				hash, _, _ := strings.Cut(key, ":")
 				if !invalidatedHashes.Has(hash) {
 					filesByHashCache.Remove(hash)
@@ -682,7 +735,10 @@ func TagStremId(hash string, filepath string, sid string) {
 	if !strings.HasPrefix(sid, "tt") {
 		return
 	}
-	_, err := db.Exec(tag_strem_id_query, sid, db.Timestamp{Time: time.Now()}, hash, filepath)
+	err := imdb_torrent.WithHashLocks([]string{hash}, func(executor db.Executor) error {
+		_, err := executor.Exec(tag_strem_id_query, sid, db.Timestamp{Time: time.Now()}, hash, filepath)
+		return err
+	})
 	if err != nil {
 		log.Error("failed to tag strem id", "error", err, "hash", hash, "fpath", filepath, "sid", sid)
 	} else {

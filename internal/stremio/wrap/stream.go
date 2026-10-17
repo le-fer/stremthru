@@ -83,7 +83,7 @@ func (ud UserData) fetchStream(ctx *Ctx, r *http.Request, rType, id string) (*st
 		chunkIdxOffset = 1
 		wg.Go(func() {
 
-			hashes, err := torrent_info.ListHashesByStremId(stremId)
+			hashes, err := torrent_info.ListHashesByStremIdFromPrimary(stremId)
 			if err != nil {
 				if errors.Is(err, torrent_stream.ErrUnsupportedStremId) {
 					return

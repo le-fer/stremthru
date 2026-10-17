@@ -51,13 +51,18 @@ func Insert(items []IMDBTorrent) error {
 	for cItems := range slices.Chunk(items, 1000) {
 		count := len(cItems)
 		args := make([]any, count*2)
+		hashes := make([]string, count)
 		for i, item := range cItems {
+			hashes[i] = item.Hash
 			args[i*2] = item.Hash
 			args[i*2+1] = item.TId
 		}
 
 		query := query_insert_before_values + util.RepeatJoin(query_insert_values_placeholder, count, ",") + query_insert_after_values
-		_, err := db.Exec(query, args...)
+		err := WithHashLocks(hashes, func(executor db.Executor) error {
+			_, err := executor.Exec(query, args...)
+			return err
+		})
 		if err != nil {
 			log.Error("failed to insert imdb torrent", "error", err)
 			return err
@@ -96,7 +101,10 @@ func DeleteByHashes(hashes []string) error {
 		for i, h := range cHashes {
 			args[i] = h
 		}
-		_, err := db.Exec(query, args...)
+		err := WithHashLocks(cHashes, func(executor db.Executor) error {
+			_, err := executor.Exec(query, args...)
+			return err
+		})
 		if err != nil {
 			log.Error("failed to delete imdb torrent by hashes", "error", err)
 			return err

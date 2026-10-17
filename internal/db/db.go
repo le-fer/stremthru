@@ -130,6 +130,22 @@ func QueryRow(query string, args ...any) *sql.Row {
 	return db.getReplica().QueryRow(adaptQuery(query), args...)
 }
 
+// GetPrimary returns an executor for operations that require read-after-write
+// consistency rather than replica reads.
+func GetPrimary() Executor { return primaryExecutor{} }
+
+type primaryExecutor struct{}
+
+func (primaryExecutor) Exec(query string, args ...any) (sql.Result, error) {
+	return Exec(query, args...)
+}
+func (primaryExecutor) Query(query string, args ...any) (*sql.Rows, error) {
+	return db.DB.Query(adaptQuery(query), args...)
+}
+func (primaryExecutor) QueryRow(query string, args ...any) *sql.Row {
+	return db.DB.QueryRow(adaptQuery(query), args...)
+}
+
 type dbExecutor struct{}
 
 func (e dbExecutor) Exec(query string, args ...any) (sql.Result, error) {

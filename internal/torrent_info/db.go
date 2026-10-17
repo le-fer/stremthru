@@ -601,6 +601,14 @@ var query_get_by_hashes = fmt.Sprintf(
 )
 
 func GetByHashes(hashes []string) (map[string]TorrentInfo, error) {
+	return getByHashes(hashes, db.GetDB())
+}
+
+func GetByHashesFromPrimary(hashes []string) (map[string]TorrentInfo, error) {
+	return getByHashes(hashes, db.GetPrimary())
+}
+
+func getByHashes(hashes []string, executor db.Executor) (map[string]TorrentInfo, error) {
 	byHash := map[string]TorrentInfo{}
 
 	if len(hashes) == 0 {
@@ -609,7 +617,7 @@ func GetByHashes(hashes []string) (map[string]TorrentInfo, error) {
 
 	query_in_hashes, args := db.InStringValues(hashes)
 	query := fmt.Sprintf("%s %s", query_get_by_hashes, query_in_hashes)
-	rows, err := db.Query(query, args...)
+	rows, err := executor.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -681,6 +689,9 @@ func GetByHashes(hashes []string) (map[string]TorrentInfo, error) {
 		byHash[tInfo.Hash] = tInfo
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return byHash, nil
 }
 
@@ -808,14 +819,40 @@ func shouldDiscardTorrentTitle(hash, ttitle string) bool {
 }
 
 func Upsert(items []TorrentInfoInsertData, category TorrentInfoCategory, discardFileIdx bool) error {
+	return upsert(items, category, discardFileIdx, false)
+}
+
+// Retry only standalone metadata statements: PostgreSQL has rolled back the
+// entire implicit transaction on a deadlock or serialization failure.
+func execMetadataWrite(query string, args ...any) error {
+	for attempt := 0; ; attempt++ {
+		_, err := db.Exec(query, args...)
+		if err == nil || db.Dialect != db.DBDialectPostgres || attempt == 2 {
+			return err
+		}
+		var pgError interface{ SQLState() string }
+		if !errors.As(err, &pgError) || (pgError.SQLState() != "40P01" && pgError.SQLState() != "40001") {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+	}
+}
+
+func upsert(items []TorrentInfoInsertData, category TorrentInfoCategory, discardFileIdx, fromPeer bool) error {
 	if len(items) == 0 {
 		return nil
 	}
+	// Match parsed writes' row-lock order without changing caller input or the
+	// original transaction boundaries and duplicate precedence.
+	items = slices.Clone(items)
 
 	streamItems := []ts.InsertData{}
 
 	errs := []error{}
 	for cItems := range slices.Chunk(items, 150) {
+		slices.SortStableFunc(cItems, func(a, b TorrentInfoInsertData) int {
+			return strings.Compare(a.Hash, b.Hash)
+		})
 		count := len(cItems)
 		seenHash := map[string]struct{}{}
 		recordDataByHash := map[string]prevRecordData{}
@@ -885,7 +922,7 @@ func Upsert(items []TorrentInfoInsertData, category TorrentInfoCategory, discard
 			continue
 		}
 
-		_, err := db.Exec(get_upsert_query(count), args...)
+		err := execMetadataWrite(get_upsert_query(count), args...)
 		if err != nil {
 			log.Error("failed to upsert torrent info", "error", err, "count", count)
 			errs = append(errs, err)
@@ -897,7 +934,11 @@ func Upsert(items []TorrentInfoInsertData, category TorrentInfoCategory, discard
 		}
 	}
 
-	if err := ts.Record(streamItems, discardFileIdx); err != nil {
+	recordFiles := ts.Record
+	if fromPeer {
+		recordFiles = ts.RecordFromPeer
+	}
+	if err := recordFiles(streamItems, discardFileIdx); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -1004,7 +1045,7 @@ var query_upsert_parsed_before_values = fmt.Sprintf(
 )
 var query_upsert_parsed_values_placeholder = fmt.Sprintf("(%s)", util.RepeatJoin("?", len(Columns), ","))
 var query_upsert_parsed_on_confict = fmt.Sprintf(
-	` ON CONFLICT (%s) DO UPDATE SET (%s) = (%s), (%s, %s) = (%s, %s)`,
+	` ON CONFLICT (%s) DO UPDATE SET (%s) = (%s), (%s, %s) = (%s, %s) WHERE ti.%s = EXCLUDED.%s`,
 	Column.Hash,
 	db.JoinColumnNames(upsert_parsed_on_conflict_columns...),
 	strings.Join(
@@ -1033,6 +1074,8 @@ var query_upsert_parsed_on_confict = fmt.Sprintf(
 	Column.UpdatedAt,
 	db.CurrentTimestamp,
 	db.CurrentTimestamp,
+	Column.TorrentTitle,
+	Column.ParserInput,
 )
 
 func get_upsert_parsed_query(count int) string {
@@ -1042,7 +1085,11 @@ func get_upsert_parsed_query(count int) string {
 }
 
 func UpsertParsed(tInfos []*TorrentInfo) error {
+	tInfos = slices.Clone(tInfos)
 	for cTInfos := range slices.Chunk(tInfos, 200) {
+		slices.SortStableFunc(cTInfos, func(a, b *TorrentInfo) int {
+			return strings.Compare(a.Hash, b.Hash)
+		})
 		count := len(cTInfos)
 		query := get_upsert_parsed_query(count)
 
@@ -1112,7 +1159,7 @@ func UpsertParsed(tInfos []*TorrentInfo) error {
 			)
 		}
 
-		if _, err := db.Exec(query, args...); err != nil {
+		if err := execMetadataWrite(query, args...); err != nil {
 			return err
 		}
 	}
@@ -1148,7 +1195,7 @@ var query_list_hashes_for_anime_by_anidb_id_from_anidb_torrent_with_episode = fm
 	anidb.TorrentColumn.EpisodeEnd,
 )
 
-func listHashesForAnimeByAniDBId(anidbId, season, episode string) ([]string, error) {
+func listHashesForAnimeByAniDBId(anidbId, season, episode string, executor db.Executor) ([]string, error) {
 	if anidbId == "" {
 		return []string{}, nil
 	}
@@ -1171,7 +1218,7 @@ func listHashesForAnimeByAniDBId(anidbId, season, episode string) ([]string, err
 		query.WriteString(query_list_hashes_for_anime_by_anidb_id_from_anidb_torrent_with_episode)
 		args = append(args, anidbId, s, ep, ep)
 	}
-	rows, err := db.Query(query.String(), args...)
+	rows, err := executor.Query(query.String(), args...)
 	if err != nil {
 		log.Error("failed to list hashes by anidb id", "error", err, "anidb_id", anidbId, "episode", episode)
 		return nil, err
@@ -1207,7 +1254,7 @@ var query_list_hashes_by_stremid_from_imdb_torrent = fmt.Sprintf(
 	imdb_torrent.Column.TId,
 )
 var query_list_hashes_by_stremid_from_imdb_torrent_for_series = fmt.Sprintf(
-	"SELECT ito.%s FROM %s ito JOIN %s ti ON ito.%s = ti.%s WHERE ito.%s = ? AND CONCAT(',', ti.%s, ',') LIKE ? AND (ti.%s = '' OR CONCAT(',', ti.%s, ',') LIKE ?)",
+	"SELECT ito.%s FROM %s ito JOIN %s ti ON ito.%s = ti.%s WHERE ito.%s = ? AND (CONCAT(',', ti.%s, ',') LIKE ? OR (ti.%s = '' AND ti.%s = %s AND ti.%s = '')) AND (ti.%s = '' OR CONCAT(',', ti.%s, ',') LIKE ?)",
 	imdb_torrent.Column.Hash,
 	imdb_torrent.TableName,
 	TableName,
@@ -1215,18 +1262,30 @@ var query_list_hashes_by_stremid_from_imdb_torrent_for_series = fmt.Sprintf(
 	Column.Hash,
 	imdb_torrent.Column.TId,
 	Column.Seasons,
+	Column.Seasons,
+	Column.Complete,
+	db.BooleanTrue,
+	Column.Episodes,
 	Column.Episodes,
 	Column.Episodes,
 )
 
 func ListHashesByStremId(stremId string) ([]string, error) {
+	return listHashesByStremId(stremId, db.GetDB())
+}
+
+func ListHashesByStremIdFromPrimary(stremId string) ([]string, error) {
+	return listHashesByStremId(stremId, db.GetPrimary())
+}
+
+func listHashesByStremId(stremId string, executor db.Executor) ([]string, error) {
 	nsid, err := ts.NormalizeStreamId(stremId)
 	if err != nil {
 		return nil, err
 	}
 
 	if nsid.IsAnime {
-		return listHashesForAnimeByAniDBId(nsid.Id, nsid.Season, nsid.Episode)
+		return listHashesForAnimeByAniDBId(nsid.Id, nsid.Season, nsid.Episode, executor)
 	}
 
 	query := ""
@@ -1252,7 +1311,7 @@ func ListHashesByStremId(stremId string) ([]string, error) {
 		args = append(args, stremId, stremId+":%", stremId)
 	}
 
-	rows, err := db.Query(query, args...)
+	rows, err := executor.Query(query, args...)
 	if err != nil {
 		log.Error("failed to list hashes by strem id", "error", err, "stremId", stremId)
 		return nil, err
@@ -1392,6 +1451,14 @@ var query_list_by_stremid_after_cond = fmt.Sprintf(
 )
 
 func ListByStremId(stremId string, excludeMissingSize bool) (*ListTorrentsData, error) {
+	return listByStremId(stremId, excludeMissingSize, db.GetDB())
+}
+
+func ListByStremIdFromPrimary(stremId string, excludeMissingSize bool) (*ListTorrentsData, error) {
+	return listByStremId(stremId, excludeMissingSize, db.GetPrimary())
+}
+
+func listByStremId(stremId string, excludeMissingSize bool, executor db.Executor) (*ListTorrentsData, error) {
 	nsid, err := ts.NormalizeStreamId(stremId)
 	if err != nil {
 		return nil, err
@@ -1448,7 +1515,7 @@ func ListByStremId(stremId string, excludeMissingSize bool) (*ListTorrentsData, 
 	}
 	query.WriteString(query_list_by_stremid_after_cond)
 
-	rows, err := db.Query(query.String(), args...)
+	rows, err := executor.Query(query.String(), args...)
 	if err != nil {
 		log.Error("failed to list torrents by strem id", "error", err, "stremId", stremId)
 		return nil, err

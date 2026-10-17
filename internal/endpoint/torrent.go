@@ -69,7 +69,11 @@ func handleListTorrents(w http.ResponseWriter, r *http.Request) {
 	noMissingSize := query.Get("no_missing_size") != ""
 	data, err := buddy.ListTorrentsByStremId(sid, localOnly, originInstanceId, noMissingSize)
 
-	w.Header().Set("Cache-Control", "public, max-age=7200")
+	if err != nil {
+		w.Header().Set("Cache-Control", "no-store")
+	} else {
+		w.Header().Set("Cache-Control", "public, max-age=7200")
+	}
 	SendResponse(w, r, 200, data, err)
 }
 
