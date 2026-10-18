@@ -2,6 +2,7 @@ package stremio_wrap
 
 import (
 	"errors"
+	"net/url"
 	"strings"
 
 	"github.com/MunifTanjim/stremthru/internal/config"
@@ -18,6 +19,7 @@ type StreamTransformer struct {
 type WrappedStream struct {
 	*stremio.Stream
 	r              *stremio_transformer.StreamExtractorResult
+	filePath       string
 	noContentProxy bool
 }
 
@@ -54,6 +56,10 @@ func (st StreamTransformer) Do(stream *stremio.Stream, sType string, tryReconfig
 
 	if tryReconfigure {
 		if s.URL != "" && data.Hash != "" {
+			// Preserve the selected file before replacing the upstream playback URL.
+			if upstreamURL, err := url.Parse(s.URL); err == nil {
+				s.filePath = upstreamURL.Query().Get("filePath")
+			}
 			s.InfoHash = data.Hash
 			s.FileIndex = data.File.Idx
 			s.URL = ""

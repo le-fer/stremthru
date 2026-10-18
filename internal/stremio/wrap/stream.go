@@ -117,8 +117,9 @@ func (ud UserData) fetchStream(ctx *Ctx, r *http.Request, rType, id string) (*st
 					return
 				}
 				wstreams[i] = WrappedStream{
-					Stream: s,
-					r:      wstream.R,
+					Stream:   s,
+					r:        wstream.R,
+					filePath: wstream.SelectedFilePath(),
 				}
 			}
 			chunks[0] = wstreams
@@ -255,6 +256,9 @@ func (ud UserData) fetchStream(ctx *Ctx, r *http.Request, rType, id string) (*st
 				surl = surl.JoinPath(url.PathEscape(stream.BehaviorHints.Filename))
 			}
 			surl.RawQuery = "sid=" + stremId
+			if stream.filePath != "" {
+				surl.RawQuery += "&filePath=" + url.QueryEscape(stream.filePath)
+			}
 			if stream.r != nil && stream.r.Season != -1 && stream.r.Episode != -1 {
 				surl.RawQuery += "&re=" + url.QueryEscape(strconv.Itoa(stream.r.Season)+".{1,3}"+strconv.Itoa(stream.r.Episode))
 			}

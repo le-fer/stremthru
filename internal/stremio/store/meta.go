@@ -14,6 +14,7 @@ import (
 	"github.com/MunifTanjim/stremthru/internal/logger"
 	"github.com/MunifTanjim/stremthru/internal/shared"
 	stremio_addon "github.com/MunifTanjim/stremthru/internal/stremio/addon"
+	stremio_shared "github.com/MunifTanjim/stremthru/internal/stremio/shared"
 	stremio_store_usenet "github.com/MunifTanjim/stremthru/internal/stremio/store/usenet"
 	stremio_store_webdl "github.com/MunifTanjim/stremthru/internal/stremio/store/webdl"
 	"github.com/MunifTanjim/stremthru/internal/torrent_info"
@@ -510,6 +511,7 @@ func handleMeta(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sType, sId := "", ""
+	seriesSID, knownTitle := "", ""
 
 	start = time.Now()
 	if idr.isUsenet {
@@ -523,8 +525,11 @@ func handleMeta(w http.ResponseWriter, r *http.Request) {
 			log.Error("failed to get strem id by hashes", "error", err)
 		} else {
 			if sid := stremIdByHashes.Get(cInfo.Hash); sid != "" {
-				sid, _, isSeries := strings.Cut(sid, ":")
-				sId = sid
+				titleID, _, isSeries := strings.Cut(sid, ":")
+				sId = titleID
+				if isSeries {
+					seriesSID = sid
+				}
 				if isSeries {
 					sType = "series"
 				} else {
@@ -543,6 +548,7 @@ func handleMeta(w http.ResponseWriter, r *http.Request) {
 		} else {
 			log.Debug("fetched meta", "duration", time.Since(start).String(), "type", sType, "id", sId)
 			m := r.Meta
+			knownTitle = m.Name
 			meta.Description += " " + m.Description
 			meta.Poster = m.Poster
 			meta.Background = m.Background
@@ -569,9 +575,18 @@ func handleMeta(w http.ResponseWriter, r *http.Request) {
 		Files:        []torrent_info.TorrentInfoInsertDataFile{},
 	}
 
-	tpttr, err := util.ParseTorrentTitle(cInfo.Name)
-	if err != nil {
-		pttLog.Warn("failed to parse", "error", err, "title", cInfo.Name)
+	fileSeasonContext := stremio_shared.FileSeasonContext{}
+	fallbackSeason := -1
+	if sType == "movie" {
+		tpttr, err := util.ParseTorrentTitle(cInfo.Name)
+		if err != nil {
+			pttLog.Warn("failed to parse", "error", err, "title", cInfo.Name)
+		} else if len(tpttr.Seasons) == 1 {
+			fallbackSeason = tpttr.Seasons[0]
+		}
+	} else {
+		fileSeasonContext = stremio_shared.LoadFileSeasonContext(seriesSID, knownTitle)
+		fallbackSeason = stremio_shared.ResolveFileSeason(nil, "/"+cInfo.Name+"/file", -1, fileSeasonContext)
 	}
 
 	for i := range cInfo.Files {
@@ -593,16 +608,28 @@ func handleMeta(w http.ResponseWriter, r *http.Request) {
 			Released:  cInfo.AddedAt,
 		}
 
+		if sType != "movie" {
+			video.Season = stremio.ZeroIndexedInt(-1)
+		}
 		season, episode := -1, -1
 		pttr, err := util.ParseTorrentTitle(f.Name)
 		if err != nil {
 			pttLog.Warn("failed to parse", "error", err, "title", f.Name)
 		} else {
-			if len(pttr.Seasons) > 0 {
-				season = pttr.Seasons[0]
-				video.Season = stremio.ZeroIndexedInt(season)
-			} else if len(tpttr.Seasons) == 1 {
-				season = tpttr.Seasons[0]
+			if sType == "movie" {
+				season = fallbackSeason
+				if len(pttr.Seasons) > 0 {
+					season = pttr.Seasons[0]
+				}
+			} else {
+				data := fileSeasonContext.ParseName(f.Name, false)
+				filenameSeasons := []int{}
+				if data.Season != -1 {
+					filenameSeasons = []int{data.Season}
+				}
+				season = stremio_shared.ResolveFileSeason(filenameSeasons, f.Path, fallbackSeason, fileSeasonContext)
+			}
+			if season != -1 {
 				video.Season = stremio.ZeroIndexedInt(season)
 			}
 			if len(pttr.Episodes) > 0 {

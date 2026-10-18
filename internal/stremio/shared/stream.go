@@ -1,6 +1,7 @@
 package stremio_shared
 
 import (
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -34,12 +35,75 @@ func MatchFileByLargestSize(files []store.File) (file store.File) {
 	return file
 }
 
-func MatchFileByName(files []store.File, name string) store.File {
-	if name == "" {
+// MatchFileByLargestSizeForStremId preserves the fallback for movies and anime,
+// but an IMDb series fallback requires positive season evidence.
+func MatchFileByLargestSizeForStremId(files []store.File, sid string, contexts ...FileSeasonContext) (file store.File) {
+	for _, f := range files {
+		if (file == nil || file.GetSize() < f.GetSize()) && FilterFileByStremSeason(f, sid, contexts...) != nil {
+			file = f
+		}
+	}
+	return file
+}
+
+// FilterFileByStremSeason guards inferred playback fallbacks. Explicit SID/ASID
+// mappings bypass it; movies and anime keep their existing matching rules.
+func FilterFileByStremSeason(file store.File, sid string, contexts ...FileSeasonContext) store.File {
+	parts := strings.SplitN(sid, ":", 3)
+	if file == nil || !strings.HasPrefix(sid, "tt") || len(parts) < 2 {
+		return file
+	}
+	season, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return file
+	}
+	context := seasonContext(contexts)
+	data := context.ParseName(file.GetName(), false)
+	reason := ""
+	if data.Season != -1 {
+		if data.Season != season {
+			reason = "filename season mismatch"
+		}
+	} else if !FilePathMatchesSeason(file.GetPath(), season, context) {
+		reason = "missing or conflicting season evidence"
+	}
+	if reason != "" {
+		log.Trace("rejecting playback fallback", "sid", sid, "filename", file.GetName(), "path", file.GetPath(), "expected_season", season, "file_season", data.Season, "reason", reason)
 		return nil
 	}
+	return file
+}
+
+// LookupFileByName returns a unique basename match and whether the name is
+// ambiguous, so callers need only one traversal of the provider's file list.
+func LookupFileByName(files []store.File, name string) (store.File, bool) {
+	if name == "" {
+		return nil, false
+	}
+	var match store.File
 	for _, f := range files {
 		if f.GetName() == name {
+			if match != nil {
+				return nil, true
+			}
+			match = f
+		}
+	}
+	return match, false
+}
+
+func MatchFileByName(files []store.File, name string) store.File {
+	file, _ := LookupFileByName(files, name)
+	return file
+}
+
+func MatchFileByPath(files []store.File, filePath string) store.File {
+	if filePath == "" {
+		return nil
+	}
+	wanted := path.Clean("/" + filePath)
+	for _, f := range files {
+		if f.GetPath() != "" && path.Clean("/"+f.GetPath()) == wanted {
 			return f
 		}
 	}
@@ -52,6 +116,20 @@ func MatchFileByPattern(files []store.File, pattern *regexp.Regexp) store.File {
 	}
 	for _, f := range files {
 		if pattern.MatchString(f.GetName()) {
+			return f
+		}
+	}
+	return nil
+}
+
+// MatchFileByPatternForStremId searches all pattern matches for an eligible
+// season instead of rejecting only the first match after selection.
+func MatchFileByPatternForStremId(files []store.File, pattern *regexp.Regexp, sid string, contexts ...FileSeasonContext) store.File {
+	if pattern == nil {
+		return nil
+	}
+	for _, f := range files {
+		if pattern.MatchString(f.GetName()) && FilterFileByStremSeason(f, sid, contexts...) != nil {
 			return f
 		}
 	}
@@ -93,7 +171,7 @@ func ParseSeasonEpisodeFromName(title string, extractDigitsAsEpisodeAgressively 
 	return data
 }
 
-func matchFileByIMDBStremId(files []store.File, sid string) store.File {
+func matchFileByIMDBStremId(files []store.File, sid string, contexts ...FileSeasonContext) store.File {
 	parts := strings.SplitN(sid, ":", 3)
 	if len(parts) != 3 {
 		return nil
@@ -111,19 +189,49 @@ func matchFileByIMDBStremId(files []store.File, sid string) store.File {
 			return nil
 		}
 	}
+	context := seasonContext(contexts)
+	var candidate store.File
+	ambiguous := false
 	for _, f := range files {
-		if d := ParseSeasonEpisodeFromName(f.GetName(), false); d.Season == expectedSeason && d.Episode == expectedEpisode {
-			return f
+		d := context.ParseName(f.GetName(), false)
+		if d.Episode != expectedEpisode {
+			continue
 		}
+		if d.Season != -1 {
+			if d.Season == expectedSeason {
+				return f
+			}
+			continue
+		}
+		if !FilePathMatchesSeason(f.GetPath(), expectedSeason, context) {
+			continue
+		}
+		if candidate != nil {
+			ambiguous = true
+		}
+		candidate = f
 	}
-	return nil
+	if ambiguous {
+		return nil
+	}
+	return candidate
 }
 
-func MatchFileByStremId(folderName string, files []store.File, sid string, torzHash string, storeCode store.StoreCode) store.File {
+func MatchFileByStremId(folderName string, files []store.File, sid string, torzHash string, storeCode store.StoreCode, contexts ...FileSeasonContext) store.File {
+	return MatchFileByStremIdWithPath(folderName, files, sid, torzHash, storeCode, "", contexts...)
+}
+
+// MatchFileByStremIdWithPath preserves a previously selected file's identity
+// across providers, whose file indexes can differ. Stored mappings still win.
+func MatchFileByStremIdWithPath(folderName string, files []store.File, sid string, torzHash string, storeCode store.StoreCode, selectedPath string, contexts ...FileSeasonContext) store.File {
 	if torzHash != "" {
 		if f, err := torrent_stream.GetFile(torzHash, sid); err != nil {
 			log.Error("failed to get file by strem id", "hash", torzHash, "sid", sid, "error", err)
 		} else if f != nil {
+			if file := MatchFileByPath(files, f.Path); file != nil {
+				log.Debug("matched file by strem id - path", "hash", torzHash, "sid", sid, "path", file.GetPath(), "fileidx", file.GetIdx(), "store.name", storeCode.Name())
+				return file
+			}
 			if file := MatchFileByIdx(files, f.Idx, storeCode); file != nil {
 				log.Debug("matched file by strem id - fileidx", "hash", torzHash, "sid", sid, "filename", file.GetName(), "fileidx", file.GetIdx(), "store.name", storeCode.Name())
 				return file
@@ -133,6 +241,12 @@ func MatchFileByStremId(folderName string, files []store.File, sid string, torzH
 				return file
 			}
 		}
+	}
+
+	context := seasonContext(contexts).WithTorrentTitle(folderName)
+	if file := FilterFileByStremSeason(MatchFileByPath(files, selectedPath), sid, context); file != nil {
+		log.Debug("matched file using selected path", "hash", torzHash, "sid", sid, "path", file.GetPath(), "fileidx", file.GetIdx(), "store.name", storeCode.Name())
+		return file
 	}
 
 	nsid, err := torrent_stream.NormalizeStreamId(sid)
@@ -210,5 +324,5 @@ func MatchFileByStremId(folderName string, files []store.File, sid string, torzH
 		return nil
 	}
 
-	return matchFileByIMDBStremId(files, sid)
+	return matchFileByIMDBStremId(files, sid, context)
 }

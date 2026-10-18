@@ -191,16 +191,17 @@ func handlePlaybackFromStore(w http.ResponseWriter, r *http.Request, ud *UserDat
 			}
 		}
 
+		fileSeasonContext := stremio_shared.LoadFileSeasonContext(sid).WithTorrentTitle(newz.Name)
 		var file store.File
 		isIMDBId := strings.HasPrefix(sid, "tt")
 
 		if strings.Contains(sid, ":") {
-			if file = stremio_shared.MatchFileByStremId(newz.Name, videoFiles, sid, "", storeCode); file != nil {
+			if file = stremio_shared.MatchFileByStremId(newz.Name, videoFiles, sid, "", storeCode, fileSeasonContext); file != nil {
 				log.Debug("matched file using strem id", "sid", sid, "filename", file.GetName())
 			}
 		}
 		if file == nil && isIMDBId && (!strings.Contains(sid, ":") || len(videoFiles) == 1) {
-			if file = stremio_shared.MatchFileByLargestSize(videoFiles); file != nil {
+			if file = stremio_shared.MatchFileByLargestSizeForStremId(videoFiles, sid, fileSeasonContext); file != nil {
 				log.Debug("matched file using largest size", "filename", file.GetName())
 			}
 		}
@@ -341,16 +342,17 @@ func handleStreamFromUsenet(w http.ResponseWriter, r *http.Request, ud *UserData
 			}
 		}
 
+		fileSeasonContext := stremio_shared.LoadFileSeasonContext(sid).WithTorrentTitle(newz.Name)
 		var file store.File
 		isIMDBId := strings.HasPrefix(sid, "tt")
 
 		if strings.Contains(sid, ":") {
-			if file = stremio_shared.MatchFileByStremId(newz.Name, videoFiles, sid, "", ctx.Store.GetName().Code()); file != nil {
+			if file = stremio_shared.MatchFileByStremId(newz.Name, videoFiles, sid, "", ctx.Store.GetName().Code(), fileSeasonContext); file != nil {
 				log.Debug("matched file using strem id", "sid", sid, "filename", file.GetName())
 			}
 		}
 		if file == nil && isIMDBId && (!strings.Contains(sid, ":") || len(videoFiles) == 1) {
-			if file = stremio_shared.MatchFileByLargestSize(videoFiles); file != nil {
+			if file = stremio_shared.MatchFileByLargestSizeForStremId(videoFiles, sid, fileSeasonContext); file != nil {
 				log.Debug("matched file using largest size", "filename", file.GetName())
 			}
 		}

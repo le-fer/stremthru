@@ -15,6 +15,7 @@ import (
 	"github.com/MunifTanjim/stremthru/internal/config"
 	"github.com/MunifTanjim/stremthru/internal/server"
 	"github.com/MunifTanjim/stremthru/internal/shared"
+	stremio_shared "github.com/MunifTanjim/stremthru/internal/stremio/shared"
 	stremio_transformer "github.com/MunifTanjim/stremthru/internal/stremio/transformer"
 	"github.com/MunifTanjim/stremthru/internal/torrent_stream"
 	"github.com/MunifTanjim/stremthru/internal/util"
@@ -357,12 +358,14 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			fileSeasonSID := videoIdWithLink
 			if !isAnime && !matcher.IdR.isUsenet && !matcher.IdR.isWebDL && meta == nil {
 				stremIdByHash, err := torrent_stream.GetStremIdByHashes([]string{cInfo.Hash})
 				if err != nil {
 					log.Error("failed to get strem id by hashes", "error", err)
 				}
 				if stremId := stremIdByHash.Get(cInfo.Hash); stremId != "" {
+					fileSeasonSID = stremId
 					sType, sId, sSeason, sEpisode := parseStremId(stremId)
 					if !isStremThruStoreId {
 						season, episode = sSeason, sEpisode
@@ -375,6 +378,14 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
+			fileSeasonContext := stremio_shared.FileSeasonContext{}
+			if !isAnime {
+				knownTitle := ""
+				if meta != nil {
+					knownTitle = meta.Name
+				}
+				fileSeasonContext = stremio_shared.LoadFileSeasonContext(fileSeasonSID, knownTitle)
+			}
 			tpttr, err := util.ParseTorrentTitle(cInfo.Name)
 			if err != nil {
 				pttLog.Warn("failed to parse", "error", err, "title", cInfo.Name)
@@ -387,8 +398,21 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 				tEpisode = tpttr.Episodes[0]
 			}
 
+			if !isAnime && contentType != string(stremio.ContentTypeMovie) {
+				tSeason = stremio_shared.ResolveFileSeason(nil, "/"+cInfo.Name+"/file", -1, fileSeasonContext)
+			}
 			var pttr *ptt.Result
 			var file *store.MagnetFile
+			var namedFile store.File
+			if matcher.FileName != "" {
+				videoFiles := []store.File{}
+				for i := range cInfo.Files {
+					if core.HasVideoExtension(cInfo.Files[i].Name) {
+						videoFiles = append(videoFiles, &cInfo.Files[i])
+					}
+				}
+				namedFile = stremio_shared.MatchFileByName(videoFiles, matcher.FileName)
+			}
 
 			for i := range cInfo.Files {
 				f := &cInfo.Files[i]
@@ -399,7 +423,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 				if matcher.FileLink != "" && matcher.FileLink == f.Link {
 					file = f
 					break
-				} else if matcher.FileName != "" && matcher.FileName == f.Name {
+				} else if matcher.FileName != "" && namedFile == f {
 					file = f
 					break
 				} else if matcher.Episode > 0 {
@@ -447,11 +471,15 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 					} else {
 						if r, err := util.ParseTorrentTitle(f.Name); err == nil {
 							pttr = r
+							data := fileSeasonContext.ParseName(f.Name, false)
+							r.Seasons = nil
+							if data.Season != -1 {
+								r.Seasons = []int{data.Season}
+							}
 							fSeason, fEpisode := tSeason, tEpisode
-							if len(r.Seasons) > 0 {
-								fSeason = r.Seasons[0]
-							} else if tSeason != -1 {
-								r.Seasons = append(r.Seasons, tSeason)
+							fSeason = stremio_shared.ResolveFileSeason(r.Seasons, f.Path, tSeason, fileSeasonContext)
+							if len(r.Seasons) == 0 && fSeason != -1 {
+								r.Seasons = append(r.Seasons, fSeason)
 							}
 							if len(r.Episodes) > 0 {
 								fEpisode = r.Episodes[0]
@@ -501,10 +529,19 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 			if pttr == nil {
 				if r, err := util.ParseTorrentTitle(file.Name); err == nil {
 					pttr = r
+					if !isAnime && contentType != string(stremio.ContentTypeMovie) {
+						data := fileSeasonContext.ParseName(file.Name, false)
+						pttr.Seasons = nil
+						if data.Season != -1 {
+							pttr.Seasons = []int{data.Season}
+						}
+					}
 					if len(pttr.Seasons) > 0 {
 						season = pttr.Seasons[0]
-					} else {
+					} else if isAnime || contentType == string(stremio.ContentTypeMovie) {
 						season = tSeason
+					} else {
+						season = stremio_shared.ResolveFileSeason(nil, file.Path, tSeason, fileSeasonContext)
 					}
 					if len(pttr.Episodes) > 0 {
 						episode = pttr.Episodes[0]

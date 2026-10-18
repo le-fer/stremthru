@@ -52,6 +52,7 @@ func handleStrem(w http.ResponseWriter, r *http.Request) {
 
 	magnetHash, encodedLink, _ := strings.Cut(r.PathValue("magnetHash"), "-")
 	fileName := r.PathValue("fileName")
+	selectedPath := r.URL.Query().Get("filePath")
 	fileIdx := -1
 	if idx, err := strconv.Atoi(r.PathValue("fileIdx")); err == nil {
 		fileIdx = idx
@@ -76,7 +77,7 @@ func handleStrem(w http.ResponseWriter, r *http.Request) {
 	ctx.Store, ctx.StoreAuthToken = s.Store, s.AuthToken
 	storeCode := s.Store.GetName().Code()
 
-	cacheKey := strings.Join([]string{ctx.ClientIP, string(storeCode), ctx.StoreAuthToken, sid, magnetHash, strconv.Itoa(fileIdx), fileName}, ":")
+	cacheKey := strings.Join([]string{ctx.ClientIP, string(storeCode), ctx.StoreAuthToken, sid, magnetHash, strconv.Itoa(fileIdx), fileName, selectedPath}, ":")
 
 	stremLink := ""
 	if stremLinkCache.Get(cacheKey, &stremLink) {
@@ -210,24 +211,25 @@ func handleStrem(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		fileSeasonContext := stremio_shared.LoadFileSeasonContext(sid).WithTorrentTitle(magnet.Name)
 		var file store.File
-		if strings.Contains(sid, ":") {
-			if file = stremio_shared.MatchFileByStremId(magnet.Name, videoFiles, sid, magnetHash, storeCode); file != nil {
+		if strings.Contains(sid, ":") || selectedPath != "" {
+			if file = stremio_shared.MatchFileByStremIdWithPath(magnet.Name, videoFiles, sid, magnetHash, storeCode, selectedPath, fileSeasonContext); file != nil {
 				log.Debug("matched file using strem id", "sid", sid, "filename", file.GetName())
 			}
 		}
 		if file == nil && fileName != "" {
-			if file = stremio_shared.MatchFileByName(videoFiles, fileName); file != nil {
+			if file = stremio_shared.FilterFileByStremSeason(stremio_shared.MatchFileByName(videoFiles, fileName), sid, fileSeasonContext); file != nil {
 				log.Debug("matched file using filename", "filename", file.GetName())
 			}
 		}
 		if file == nil {
-			if file = stremio_shared.MatchFileByIdx(videoFiles, fileIdx, storeCode); file != nil {
+			if file = stremio_shared.FilterFileByStremSeason(stremio_shared.MatchFileByIdx(videoFiles, fileIdx, storeCode), sid, fileSeasonContext); file != nil {
 				log.Debug("matched file using fileidx", "fileidx", file.GetIdx(), "filename", file.GetName())
 			}
 		}
 		if file == nil && isIMDBId && (!strings.Contains(sid, ":") || len(videoFiles) == 1) {
-			if file = stremio_shared.MatchFileByLargestSize(videoFiles); file != nil {
+			if file = stremio_shared.MatchFileByLargestSizeForStremId(videoFiles, sid, fileSeasonContext); file != nil {
 				log.Debug("matched file using largest size", "filename", file.GetName())
 				shouldTagStream = len(videoFiles) == 1
 			}

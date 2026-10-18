@@ -152,29 +152,31 @@ func handleStrem(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		fileSeasonContext := stremio_shared.LoadFileSeasonContext(sid).WithTorrentTitle(magnet.Name)
 		var file store.File
-		if fileName != "" {
-			if file = stremio_shared.MatchFileByName(videoFiles, fileName); file != nil {
-				log.Debug("matched file using filename", "filename", file.GetName())
-			}
+		if strings.Contains(sid, ":") || query.Get("filePath") != "" {
+			file = stremio_shared.MatchFileByStremIdWithPath(magnet.Name, videoFiles, sid, magnetHash, storeCode, query.Get("filePath"), fileSeasonContext)
 		}
-		if file == nil && strings.Contains(sid, ":") {
-			if file = stremio_shared.MatchFileByStremId(magnet.Name, videoFiles, sid, magnetHash, storeCode); file != nil {
-				log.Debug("matched file using stream id", "sid", sid, "filename", file.GetName())
-			}
-		}
+		namedFile, ambiguousName := stremio_shared.LookupFileByName(videoFiles, fileName)
 		if file == nil {
-			if file = stremio_shared.MatchFileByIdx(videoFiles, fileIdx, storeCode); file != nil {
+			file = stremio_shared.FilterFileByStremSeason(namedFile, sid, fileSeasonContext)
+		}
+		if ambiguousName {
+			log.Trace("ambiguous playback filename", "hash", magnetHash, "sid", sid, "filename", fileName)
+		}
+
+		if file == nil {
+			if file = stremio_shared.FilterFileByStremSeason(stremio_shared.MatchFileByIdx(videoFiles, fileIdx, storeCode), sid, fileSeasonContext); file != nil {
 				log.Debug("matched file using fileidx", "fileidx", file.GetIdx(), "filename", file.GetName())
 			}
 		}
-		if file == nil && pattern != nil {
-			if file = stremio_shared.MatchFileByPattern(videoFiles, pattern); file != nil {
+		if file == nil && pattern != nil && !ambiguousName {
+			if file = stremio_shared.MatchFileByPatternForStremId(videoFiles, pattern, sid, fileSeasonContext); file != nil {
 				log.Debug("matched file using pattern", "pattern", pattern.String(), "filename", file.GetName())
 			}
 		}
-		if file == nil {
-			if file = stremio_shared.MatchFileByLargestSize(videoFiles); file != nil {
+		if file == nil && !ambiguousName {
+			if file = stremio_shared.MatchFileByLargestSizeForStremId(videoFiles, sid, fileSeasonContext); file != nil {
 				log.Debug("matched file using largest size", "filename", file.GetName())
 				shouldTagStream = false
 			}

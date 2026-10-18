@@ -1,8 +1,9 @@
 package torrent_info
 
 import (
+	"crypto/sha1"
 	"database/sql"
-	"strings"
+	"fmt"
 	"testing"
 
 	"github.com/MunifTanjim/stremthru/internal/db"
@@ -41,7 +42,8 @@ func queryStreamSId(t *testing.T, hash, path string) (string, error) {
 func TestUpsertRecordsTorrentStreamBeforeReturning(t *testing.T) {
 	setupTestDB(t)
 
-	hash := strings.Repeat("a", 40)
+	// Each run gets a fresh database; avoid reusing keys from process-wide caches.
+	hash := fmt.Sprintf("%x", sha1.Sum([]byte(t.TempDir())))
 	path := "/Some.Movie.2024.1080p.mkv"
 
 	err := Upsert([]TorrentInfoInsertData{{
