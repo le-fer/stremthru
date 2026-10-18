@@ -19,8 +19,9 @@ const sqliteDefaultMaxConns = 8
 
 type DB struct {
 	*sql.DB
-	URI     ConnectionURI
-	onClose func() error
+	URI           ConnectionURI
+	onClose       func() error
+	advisoryLocks *sql.DB
 
 	replicas       []*sql.DB
 	replicaIdx     uint32
@@ -232,9 +233,16 @@ func Open() *DB {
 		if err != nil {
 			log.Fatalf("[db] failed to create connection pool: %v\n", err)
 		}
+		poolConfig := pool.Config()
+		advisoryLocks := stdlib.OpenDB(*poolConfig.ConnConfig)
+		advisoryLocks.SetMaxOpenConns(postgresAdvisoryLockMaxConns)
+		advisoryLocks.SetMaxIdleConns(postgresAdvisoryLockMaxConns)
+		advisoryLocks.SetConnMaxLifetime(poolConfig.MaxConnLifetime)
+		advisoryLocks.SetConnMaxIdleTime(poolConfig.MaxConnIdleTime)
+		db.advisoryLocks = advisoryLocks
 		db.DB = stdlib.OpenDBFromPool(pool)
 		db.onClose = func() error {
-			err := db.DB.Close()
+			err := errors.Join(advisoryLocks.Close(), db.DB.Close())
 			pool.Close()
 			return err
 		}
