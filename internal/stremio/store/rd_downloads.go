@@ -63,7 +63,7 @@ func getRDWebDLsMeta(r *http.Request, ctx *Ctx, idr *ParsedId) stremio.Meta {
 
 			for i := range res.Data {
 				dl := &res.Data[i]
-				if dl.Host == "real-debrid.com" || !core.HasVideoExtension(dl.Filename) {
+				if dl.Host == "real-debrid.com" || !core.HasVideoExtension(dl.Filename) || core.IsSampleFile(dl.Filename, "") {
 					continue
 				}
 				stream := stremio.Stream{

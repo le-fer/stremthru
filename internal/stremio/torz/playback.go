@@ -209,6 +209,7 @@ func handleStrem(w http.ResponseWriter, r *http.Request) {
 				videoFiles = append(videoFiles, f)
 			}
 		}
+		videoFiles = stremio_shared.ExcludeSampleFiles(videoFiles)
 
 		var file store.File
 		if strings.Contains(sid, ":") {

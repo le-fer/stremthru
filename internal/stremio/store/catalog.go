@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/cache"
 	"github.com/MunifTanjim/stremthru/internal/config"
 	"github.com/MunifTanjim/stremthru/internal/logger"
@@ -236,11 +237,11 @@ func getCatalogItems(s store.Store, storeToken string, clientIp string, idr *Par
 	idStoreCode := idr.getStoreCode()
 
 	if idr.isUsenet {
-		return getUsenetCatalogItems(s, storeToken, clientIp, idStoreCode, log)
+		return excludeSampleCatalogItems(getUsenetCatalogItems(s, storeToken, clientIp, idStoreCode, log))
 	}
 
 	if idr.isWebDL {
-		return getWebDLCatalogItems(s, storeToken, clientIp, idStoreCode, log)
+		return excludeSampleCatalogItems(getWebDLCatalogItems(s, storeToken, clientIp, idStoreCode, log))
 	}
 
 	items := []CachedCatalogItem{}
@@ -317,7 +318,18 @@ func getCatalogItems(s store.Store, storeToken string, clientIp string, idr *Par
 		go torrent_info.Upsert(tInfoItems, "", storeCode != store.StoreCodeRealDebrid)
 	}
 
-	return items
+	return excludeSampleCatalogItems(items)
+}
+
+// Filter presentation without mutating provider data or cached evidence.
+func excludeSampleCatalogItems(items []CachedCatalogItem) []CachedCatalogItem {
+	result := make([]CachedCatalogItem, 0, len(items))
+	for _, item := range items {
+		if !core.IsSampleFile(item.Name, "") {
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 type ExtraData struct {

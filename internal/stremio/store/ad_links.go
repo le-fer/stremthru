@@ -64,10 +64,13 @@ func getADWebDLsMeta(r *http.Request, ctx *Ctx, idr *ParsedId, eud string) strem
 			videoId := idPrefix + dl.Id
 			isDirectLink := false
 			if len(dl.Files) == 0 {
+				if core.IsSampleFile(dl.Name, "") {
+					continue
+				}
 				stream.URL = streamBaseUrl.JoinPath(url.PathEscape(videoId)).String()
 			} else {
 				file := dl.Files[0]
-				if !core.HasVideoExtension(file.Name) {
+				if !core.HasVideoExtension(file.Name) || core.IsSampleFile(file.Name, file.Path) {
 					continue
 				}
 				isDirectLink = true

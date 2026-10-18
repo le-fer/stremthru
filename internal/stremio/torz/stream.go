@@ -315,12 +315,28 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 
 	strn := util.NewStringNormalizer()
 	tInfosToUpsert := []torrent_info.TorrentItem{}
+	rejectedFileEvidence := []torrent_info.TorrentItem{}
 	wrappedStreams := []WrappedStream{}
 	for i, items := range results {
 		is_exact := sQueries[i].is_exact
 		for i := range items {
 			item := &items[i]
 			if item.HasMissingData() {
+				continue
+			}
+			storedFiles := filesByHashes[item.Hash]
+			if hasOnlySampleVideos(torrent_stream.Files(item.Files), storedFiles) ||
+				(len(item.Files) == 0 && len(storedFiles) == 0 &&
+					(core.IsSampleFile(item.Title, "") || core.IsSampleFile(tInfoByHash[item.Hash].TorrentTitle, ""))) {
+				if len(item.Files) > 0 {
+					// Keep known sample-only lists available to later stored requests even if
+					// the indexer is unavailable or omits its file list next time.
+					rejectedFileEvidence = append(rejectedFileEvidence, torrent_info.TorrentItem{
+						Hash: item.Hash, TorrentTitle: item.Title, Size: item.Size,
+						Indexer: item.Indexer, Source: torrent_info.TorrentInfoSourceIndexer,
+						Seeders: item.Seeders, Leechers: item.Leechers, Private: item.Private, Files: item.Files,
+					})
+				}
 				continue
 			}
 
@@ -347,20 +363,7 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 			}
 
 			if tInfo, ok := tInfoByHash[item.Hash]; ok {
-				var file *torrent_stream.File
-				if files, ok := filesByHashes[item.Hash]; ok {
-					idToMatch := stremId
-					if idToMatch != "" {
-						for i := range files {
-							f := &files[i]
-							if f.IsVideo() {
-								if f.SId == idToMatch || f.ASId == idToMatch {
-									file = f
-								}
-							}
-						}
-					}
-				}
+				file := selectNonSampleTorrentFile(item.Files, filesByHashes[item.Hash], stremId, nsid)
 				fName := ""
 				fIdx := -1
 				fSize := int64(0)
@@ -372,7 +375,7 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 						fSize = file.Size
 					}
 					fVideoHash = file.VideoHash
-				} else if core.HasVideoExtension(tInfo.TorrentTitle) {
+				} else if core.HasVideoExtension(tInfo.TorrentTitle) && !core.IsSampleFile(tInfo.TorrentTitle, "") {
 					fName = tInfo.TorrentTitle
 				}
 
@@ -472,6 +475,7 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 					Name: "Torz",
 				},
 				Category: stremType,
+				File:     stremio_transformer.StreamExtractorResultFile{Idx: -1},
 			}
 
 			wrappedStream := WrappedStream{
@@ -481,6 +485,7 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 					Name:        data.Addon.Name,
 					Description: data.TTitle,
 					InfoHash:    data.Hash,
+					FileIndex:   -1,
 					BehaviorHints: &stremio.StreamBehaviorHints{
 						Filename:   data.File.Name,
 						BingeGroup: "torz:" + data.Hash,
@@ -489,43 +494,27 @@ func GetStreamsFromIndexers(reqCtx context.Context, ctx *Ctx, stremType, stremId
 			}
 
 			if len(item.Files) > 0 {
-				var file *torrent_stream.File
-				if files, ok := filesByHashes[item.Hash]; ok {
-					idToMatch := stremId
-					if nsid.IsAnime {
-						if nsid.Id == "" {
-							idToMatch = ""
-						} else {
-							idToMatch = nsid.Id + ":" + nsid.Episode
-						}
-					}
-					if idToMatch != "" {
-						for i := range files {
-							f := &files[i]
-							if f.IsVideo() {
-								if f.SId == idToMatch || f.ASId == idToMatch {
-									file = f
-								}
-							}
-						}
-					}
-				}
+				file := selectNonSampleTorrentFile(item.Files, filesByHashes[item.Hash], stremId, nsid)
 				if file != nil {
 					data.File.Idx = file.Idx
 					wrappedStream.Stream.FileIndex = file.Idx
 					data.File.Name = file.Name
+					wrappedStream.Stream.BehaviorHints.Filename = file.Name
 					if file.Size > 0 {
 						data.File.Size = util.ToSize(file.Size)
 						wrappedStream.Stream.BehaviorHints.VideoSize = file.Size
 					}
 					wrappedStream.Stream.BehaviorHints.VideoHash = file.VideoHash
-				} else if core.HasVideoExtension(tInfo.TorrentTitle) {
+				} else if core.HasVideoExtension(tInfo.TorrentTitle) && !core.IsSampleFile(tInfo.TorrentTitle, "") {
 					data.File.Name = tInfo.TorrentTitle
 				}
 			}
 
 			wrappedStreams = append(wrappedStreams, wrappedStream)
 		}
+	}
+	if err := torrent_info.Upsert(rejectedFileEvidence, torrent_info.TorrentInfoCategoryUnknown, false); err != nil {
+		log.Warn("failed to retain rejected indexer file evidence", "error", err)
 	}
 	go torrent_info.Upsert(tInfosToUpsert, torrent_info.TorrentInfoCategoryUnknown, false)
 
@@ -550,47 +539,14 @@ func GetStreamsForHashes(stremType, stremId string, hashes []string, nsid *torre
 			continue
 		}
 
-		var file *torrent_stream.File
-		if files, ok := filesByHashes[hash]; ok {
-			idToMatch := stremId
-			if nsid.IsAnime {
-				if nsid.Id == "" {
-					idToMatch = ""
-				} else {
-					idToMatch = nsid.Id + ":" + nsid.Episode
-				}
-			}
-			if idToMatch != "" {
-				for i := range files {
-					f := &files[i]
-					if f.IsVideo() {
-						if f.SId == idToMatch || f.ASId == idToMatch {
-							file = f
-							break
-						}
-					}
-				}
-			}
-			if file == nil && !nsid.IsAnime && nsid.IsSeries() && nsid.Episode != "" {
-				for i := range files {
-					f := &files[i]
-					if f.IsVideo() {
-						data := stremio_shared.ParseSeasonEpisodeFromName(f.Name, false)
-						if data.Season != -1 && strconv.Itoa(data.Season) != nsid.Season {
-							continue
-						}
-						if data.Episode == -1 || strconv.Itoa(data.Episode) != nsid.Episode {
-							continue
-						}
-						file = f
-						break
-					}
-				}
-				if file == nil {
-					log.Trace("skipping torrent: no matching file found", "hash", tInfo.Hash, "sid", stremId)
-					continue
-				}
-			}
+		if hasOnlySampleVideos(filesByHashes[hash]) || (len(filesByHashes[hash]) == 0 && core.IsSampleFile(tInfo.TorrentTitle, "")) {
+			continue
+		}
+		files := filesByHashes[hash]
+		file := selectNonSampleTorrentFile(nil, files, stremId, nsid)
+		if len(files) > 0 && file == nil && !nsid.IsAnime && nsid.IsSeries() && nsid.Episode != "" {
+			log.Trace("skipping torrent: no matching file found", "hash", tInfo.Hash, "sid", stremId)
+			continue
 		}
 
 		pttr, err := tInfo.ToParsedResult()
@@ -629,7 +585,7 @@ func GetStreamsForHashes(stremType, stremId string, hashes []string, nsid *torre
 			fVideoHash = file.VideoHash
 
 			stremio_transformer.ApplyMediaInfo(data, file.MediaInfo)
-		} else if core.HasVideoExtension(tInfo.TorrentTitle) {
+		} else if core.HasVideoExtension(tInfo.TorrentTitle) && !core.IsSampleFile(tInfo.TorrentTitle, "") {
 			data.File.Name = tInfo.TorrentTitle
 		}
 

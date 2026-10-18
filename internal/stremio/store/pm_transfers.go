@@ -54,7 +54,7 @@ func getPMWebDLsMeta(r *http.Request, ctx *Ctx, idr *ParsedId, eud string) (stre
 				continue
 			}
 			file := item.Files[0]
-			if strings.HasPrefix(file.Path, "stremthru/") || !core.HasVideoExtension(file.Name) {
+			if strings.HasPrefix(file.Path, "stremthru/") || !core.HasVideoExtension(file.Name) || core.IsSampleFile(file.Name, file.Path) {
 				continue
 			}
 			streamId := idPrefix + item.Id

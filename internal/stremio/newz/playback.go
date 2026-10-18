@@ -186,7 +186,7 @@ func handlePlaybackFromStore(w http.ResponseWriter, r *http.Request, ud *UserDat
 		videoFiles := []store.File{}
 		for i := range newz.Files {
 			f := &newz.Files[i]
-			if core.HasVideoExtension(f.Name) {
+			if core.HasVideoExtension(f.Name) && !core.IsSampleFile(f.Name, f.Path) {
 				videoFiles = append(videoFiles, f)
 			}
 		}
@@ -336,7 +336,7 @@ func handleStreamFromUsenet(w http.ResponseWriter, r *http.Request, ud *UserData
 		videoFiles := []store.File{}
 		for i := range newz.Files {
 			f := &newz.Files[i]
-			if core.HasVideoExtension(f.Name) {
+			if core.HasVideoExtension(f.Name) && !core.IsSampleFile(f.Name, f.Path) {
 				videoFiles = append(videoFiles, f)
 			}
 		}

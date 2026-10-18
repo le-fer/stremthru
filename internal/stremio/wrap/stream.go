@@ -182,7 +182,7 @@ func (ud UserData) fetchStream(ctx *Ctx, r *http.Request, rType, id string) (*st
 		if errs[0] != nil {
 			log.Error("failed to fetch torz streams", "error", errs[0])
 		} else {
-			allStreams = append(allStreams, chunks[0]...)
+			allStreams = append(allStreams, excludeSampleStreams(chunks[0])...)
 		}
 	}
 	for i := range chunks[chunkIdxOffset:] {
@@ -191,7 +191,7 @@ func (ud UserData) fetchStream(ctx *Ctx, r *http.Request, rType, id string) (*st
 		if errs[idx] != nil {
 			log.Error("failed to fetch streams", "error", errs[idx], "hostname", hostname)
 		} else {
-			allStreams = append(allStreams, chunks[idx]...)
+			allStreams = append(allStreams, excludeSampleStreams(chunks[idx])...)
 		}
 	}
 
@@ -333,11 +333,26 @@ func (ud UserData) fetchStream(ctx *Ctx, r *http.Request, rType, id string) (*st
 	}, nil
 }
 
+// Filter each upstream chunk before deduplication, so a sample cannot hide its
+// full-file sibling. Keep this separate from metadata-dependent user filters.
+func excludeSampleStreams(streams []WrappedStream) []WrappedStream {
+	result := make([]WrappedStream, 0, len(streams))
+	for _, stream := range streams {
+		if (stream.BehaviorHints != nil && core.IsSampleFile(stream.BehaviorHints.Filename, "")) || (stream.r != nil && core.IsSampleFile(stream.r.File.Name, "")) {
+			continue
+		}
+		result = append(result, stream)
+	}
+	return result
+}
+
 func filterStreams(streams []WrappedStream, filter *stremio_transformer.StreamFilter) []WrappedStream {
+	streams = excludeSampleStreams(streams)
 	if filter == nil || filter.IsEmpty() {
 		return streams
 	}
 	result := make([]WrappedStream, 0, len(streams))
+
 	for i := range streams {
 		stream := &streams[i]
 		if stream.r == nil || filter.Match(stream.r) {

@@ -58,7 +58,7 @@ type News struct {
 func (n News) GetLargestFileName() string {
 	name, size := "", int64(0)
 	for i, file := range n.Files {
-		if file.Size > size {
+		if core.HasVideoExtension(file.Name) && !core.IsSampleFile(file.Name, file.Path) && file.Size > size {
 			name = file.Name
 			size = file.Size
 		}
@@ -118,7 +118,7 @@ func ListNews(params *ListNewsParams, storeName store.StoreName) (*ListNewsData,
 					Path: "/" + f.Name,
 					Size: f.Size,
 				}
-				if hasGarbageName && file.Size > maxFileSize {
+				if hasGarbageName && core.HasVideoExtension(file.Name) && !core.IsSampleFile(file.Name, file.Path) && file.Size > maxFileSize {
 					item.Name = file.Name
 					maxFileSize = file.Size
 				}
@@ -195,7 +195,7 @@ func GetNews(params *GetNewsParams, storeName store.StoreName) (*News, error) {
 				Path: "/" + f.Name,
 				Size: f.Size,
 			}
-			if hasGarbageName && file.Size > maxFileSize {
+			if hasGarbageName && core.HasVideoExtension(file.Name) && !core.IsSampleFile(file.Name, file.Path) && file.Size > maxFileSize {
 				item.Name = file.Name
 				maxFileSize = file.Size
 			}

@@ -299,6 +299,7 @@ func getStoreContentInfo(s store.Store, storeToken string, id string, clientIp s
 			for _, f := range news.Files {
 				cInfo.Files = append(cInfo.Files, store.MagnetFile{
 					Idx:       f.Idx,
+					Path:      f.Path,
 					Name:      f.Name,
 					Size:      f.Size,
 					Link:      f.Link,
@@ -335,6 +336,7 @@ func getStoreContentInfo(s store.Store, storeToken string, id string, clientIp s
 				for _, f := range webz.Files {
 					cInfo.Files = append(cInfo.Files, store.MagnetFile{
 						Idx:       f.Idx,
+						Path:      f.Path,
 						Name:      f.Name,
 						Size:      f.Size,
 						Link:      f.Link,
@@ -364,6 +366,7 @@ func getStoreContentInfo(s store.Store, storeToken string, id string, clientIp s
 			for _, f := range webdl.Files {
 				cInfo.Files = append(cInfo.Files, store.MagnetFile{
 					Idx:       f.Idx,
+					Path:      f.Path,
 					Name:      f.Name,
 					Size:      f.Size,
 					Link:      f.Link,
@@ -576,7 +579,7 @@ func handleMeta(w http.ResponseWriter, r *http.Request) {
 
 	for i := range cInfo.Files {
 		f := &cInfo.Files[i]
-		if !core.HasVideoExtension(f.Name) {
+		if !core.HasVideoExtension(f.Name) || core.IsSampleFile(f.Name, f.Path) {
 			continue
 		}
 

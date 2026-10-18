@@ -288,6 +288,13 @@ func GenerateLink(params *GenerateLinkParams, storeName store.StoreName) (*Gener
 		if err != nil {
 			return nil, err
 		}
+		if core.IsSampleFile(res.Data.Filename, "") {
+			error := core.NewAPIError("sample files are not playable")
+			error.StatusCode = http.StatusUnprocessableEntity
+			error.StoreName = string(storeName)
+			return nil, error
+		}
+
 		data := GenerateLinkData{}
 		if res.Data.Link != "" {
 			if !core.HasVideoExtension(res.Data.Filename) {
@@ -337,6 +344,13 @@ func GenerateLink(params *GenerateLinkParams, storeName store.StoreName) (*Gener
 		if err != nil {
 			return nil, err
 		}
+		if core.IsSampleFile(res.Data.Name, "") {
+			error := core.NewAPIError("sample files are not playable")
+			error.StatusCode = http.StatusUnprocessableEntity
+			error.StoreName = string(storeName)
+			return nil, error
+		}
+
 		link := res.Data.StreamLink
 		if link == "" {
 			link = res.Data.Link

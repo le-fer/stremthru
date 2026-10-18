@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/cache"
 	"github.com/MunifTanjim/stremthru/internal/config"
 	"github.com/MunifTanjim/stremthru/internal/shared"
@@ -66,6 +67,12 @@ func handleStrem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	fileName := r.PathValue("fileName")
+	if core.IsSampleFile(fileName, "") {
+		store_video.Redirect("no_matching_file", w, r)
+		return
+	}
+
 	cacheKey := strings.Join([]string{ctx.ClientIP, idr.getStoreCode(), ctx.StoreAuthToken, url}, ":")
 
 	stremLink := ""
@@ -74,8 +81,6 @@ func handleStrem(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, stremLink, http.StatusFound)
 		return
 	}
-
-	fileName := r.PathValue("fileName")
 
 	if idr.isUsenet {
 		newzStore, ok := ctx.Store.(store.NewzStore)

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
 	"sync"
 
@@ -21,8 +20,6 @@ import (
 	"github.com/MunifTanjim/stremthru/store"
 	"github.com/MunifTanjim/stremthru/stremio"
 )
-
-var sampleFileRegex = regexp.MustCompile(`(?i)\bsample\b`)
 
 var streamTemplate = func() *stremio_transformer.StreamTemplate {
 	tmplBlob := stremio_transformer.StreamTemplateDefault.Blob
@@ -392,7 +389,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 
 			for i := range cInfo.Files {
 				f := &cInfo.Files[i]
-				if !core.HasVideoExtension(f.Name) {
+				if !core.HasVideoExtension(f.Name) || core.IsSampleFile(f.Name, f.Path) {
 					continue
 				}
 
@@ -461,9 +458,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 							if fSeason == matcher.Season && fEpisode == matcher.Episode {
 								file = f
 								season, episode = fSeason, fEpisode
-								if !sampleFileRegex.MatchString(f.GetName()) {
-									break
-								}
+								break
 							}
 						} else {
 							pttLog.Warn("failed to parse", "error", err, "title", f.Name)

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/MunifTanjim/go-ptt"
+	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/internal/anidb"
 	"github.com/MunifTanjim/stremthru/internal/torrent_info"
 	"github.com/MunifTanjim/stremthru/internal/torrent_stream"
@@ -18,6 +19,9 @@ func MatchFileByIdx(files []store.File, idx int, storeCode store.StoreCode) stor
 		return nil
 	}
 	for _, f := range files {
+		if core.IsSampleFile(f.GetName(), f.GetPath()) {
+			continue
+		}
 		if f.GetIdx() == idx {
 			return f
 		}
@@ -27,6 +31,9 @@ func MatchFileByIdx(files []store.File, idx int, storeCode store.StoreCode) stor
 
 func MatchFileByLargestSize(files []store.File) (file store.File) {
 	for _, f := range files {
+		if core.IsSampleFile(f.GetName(), f.GetPath()) {
+			continue
+		}
 		if file == nil || file.GetSize() < f.GetSize() {
 			file = f
 		}
@@ -39,6 +46,9 @@ func MatchFileByName(files []store.File, name string) store.File {
 		return nil
 	}
 	for _, f := range files {
+		if core.IsSampleFile(f.GetName(), f.GetPath()) {
+			continue
+		}
 		if f.GetName() == name {
 			return f
 		}
@@ -51,6 +61,9 @@ func MatchFileByPattern(files []store.File, pattern *regexp.Regexp) store.File {
 		return nil
 	}
 	for _, f := range files {
+		if core.IsSampleFile(f.GetName(), f.GetPath()) {
+			continue
+		}
 		if pattern.MatchString(f.GetName()) {
 			return f
 		}
@@ -66,6 +79,18 @@ type seasonEpisodeData struct {
 	Season      int
 	Episode     int
 	ReleaseType string
+}
+
+// ExcludeSampleFiles preserves provider order and file identities while keeping
+// sample exclusion separate from validation. The supplied evidence is unchanged.
+func ExcludeSampleFiles(files []store.File) []store.File {
+	result := make([]store.File, 0, len(files))
+	for _, file := range files {
+		if !core.IsSampleFile(file.GetName(), file.GetPath()) {
+			result = append(result, file)
+		}
+	}
+	return result
 }
 
 func ParseSeasonEpisodeFromName(title string, extractDigitsAsEpisodeAgressively bool) seasonEpisodeData {
@@ -95,6 +120,7 @@ func ParseSeasonEpisodeFromName(title string, extractDigitsAsEpisodeAgressively 
 
 func matchFileByIMDBStremId(files []store.File, sid string) store.File {
 	parts := strings.SplitN(sid, ":", 3)
+	files = ExcludeSampleFiles(files)
 	if len(parts) != 3 {
 		return nil
 	}
@@ -152,6 +178,9 @@ func MatchFileByStremId(folderName string, files []store.File, sid string, torzH
 
 		minEpisode := 99999
 		for _, f := range files {
+			if core.IsSampleFile(f.GetName(), f.GetPath()) {
+				continue
+			}
 			d := ParseSeasonEpisodeFromName(f.GetName(), true)
 			dataByName[f.GetName()] = d
 			if d.ReleaseType == "" && (d.Episode != -1) && ((d.Season == -1 && expectedSeason == 1) || d.Season == expectedSeason) {
@@ -173,6 +202,9 @@ func MatchFileByStremId(folderName string, files []store.File, sid string, torzH
 			if absMap != nil {
 				expectedEpisode = expectedEpisode + absMap.Offset
 				for _, f := range files {
+					if core.IsSampleFile(f.GetName(), f.GetPath()) {
+						continue
+					}
 					d := dataByName[f.GetName()]
 					if d.Episode == expectedEpisode {
 						return f
